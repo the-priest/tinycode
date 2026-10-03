@@ -1,0 +1,431 @@
+"""The agent loop. UI-agnostic: the TUI and the headless runner both drive it
+through the AgentUI callbacks."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+from .config import Config, log
+from .context import (COMPACT_PROMPT, build_system_prompt, estimate_tokens, prune,
+                      transcript_for_summary)
+from .ollama import ChatStream, Ollama, OllamaError
+from .parsing import (RepetitionGuard, extract_text_tool_calls, missing_required,
+                      normalize_native_calls)
+from .tools import EDIT_TOOLS, TOOL_SCHEMAS, ToolResult, Tools
+
+THINK_BUDGET_CHARS = 12000   # ~3k tokens of reasoning per step is plenty
+
+
+@dataclass
+class Decision:
+    allow: bool
+    always: bool = False
+    feedback: str = ""
+
+
+class AgentUI:
+    """Override what you need. All async methods run on the event loop."""
+
+    async def step_start(self, step: int) -> None: ...
+    async def thinking_delta(self, text: str) -> None: ...
+    async def thinking_end(self, seconds: float) -> None: ...
+    async def content_delta(self, text: str) -> None: ...
+    async def content_end(self, final_text: str) -> None: ...
+    async def tool_start(self, call_id: str, name: str, args: dict) -> None: ...
+    def tool_output(self, call_id: str, text: str) -> None:  # any thread
+        ...
+    async def tool_end(self, call_id: str, name: str, args: dict,
+                       result: ToolResult, seconds: float) -> None: ...
+    async def approve(self, name: str, args: dict, diff: str, warning: str) -> Decision:
+        return Decision(False, feedback="no interactive approval available")
+    async def notice(self, text: str, level: str = "info") -> None: ...
+    async def stats(self, info: dict) -> None: ...
+    async def todos(self, todos: list[dict]) -> None: ...
+    async def status(self, text: str) -> None: ...
+
+
+@dataclass
+class StepResult:
+    content: str = ""
+    thinking: str = ""
+    raw_calls: list = field(default_factory=list)
+    final: dict = field(default_factory=dict)
+    aborted: str = ""        # "", cancel, repetition, think_budget, length
+    think_seconds: float = 0.0
+
+
+class Agent:
+    def __init__(self, cfg: Config, client: Ollama, workdir: Path, ui: AgentUI):
+        self.cfg = cfg
+        self.client = client
+        self.workdir = workdir
+        self.ui = ui
+        self.tools = Tools(workdir, cfg, on_todos=self._on_todos)
+        self.system_prompt, self.memory_files = build_system_prompt(workdir)
+        self.messages: list[dict] = [{"role": "system", "content": self.system_prompt}]
+        self.mode = cfg.mode
+        self.think = cfg.think
+        self.always: set[str] = set()
+        self.undo_stack: list[dict] = []
+        self.busy = False
+        self._cancel = False
+        self._stream: Optional[ChatStream] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.last_prompt_tokens = 0
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.calib = 1.0
+        self.turn_started = 0.0
+
+    # ----------------------------------------------------------- utilities
+    def _on_todos(self, todos: list[dict]) -> None:
+        loop = self._loop
+        if loop is not None:
+            asyncio.run_coroutine_threadsafe(self.ui.todos(todos), loop)
+
+    def reset(self) -> None:
+        self.system_prompt, self.memory_files = build_system_prompt(self.workdir)
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+        self.tools.todos = []
+        self.tools.read_files.clear()
+        self.undo_stack.clear()
+        self.last_prompt_tokens = 0
+
+    def refresh_system_prompt(self) -> None:
+        self.system_prompt, self.memory_files = build_system_prompt(self.workdir)
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0] = {"role": "system", "content": self.system_prompt}
+
+    def context_used(self) -> int:
+        est = int(estimate_tokens(self.messages) * self.calib)
+        return max(est, self.last_prompt_tokens) if self.last_prompt_tokens else est
+
+    def cancel(self) -> None:
+        self._cancel = True
+        self.tools.cancel.set()
+        if self._stream is not None:
+            self._stream.close()
+
+    # ------------------------------------------------------------ the loop
+    async def run(self, user_text: str, display_text: Optional[str] = None) -> str:
+        """Run one user turn to completion. Returns the final answer text."""
+        self._loop = asyncio.get_running_loop()
+        self.busy = True
+        self._cancel = False
+        self.tools.cancel.clear()
+        self.turn_started = time.monotonic()
+        self.messages.append({"role": "user", "content": user_text})
+        final_text = ""
+        recent: dict[str, int] = {}
+        retries = 0
+        step = 0
+        try:
+            while step < self.cfg.max_steps:
+                step += 1
+                if self._cancel:
+                    break
+                await self.ui.step_start(step)
+                await self._fit_context()
+                think = self.think and retries == 0
+                nudge = None
+                if retries >= 2:
+                    nudge = ("Your previous attempt failed (it got stuck or was empty). "
+                             "Respond now: either call ONE tool, or give the final answer "
+                             "in a few sentences.")
+                res = await self._model_step(think, nudge)
+
+                if res.aborted == "cancel":
+                    if res.content.strip():
+                        self.messages.append({"role": "assistant",
+                                              "content": res.content.strip() + "\n[interrupted]"})
+                    break
+
+                calls, errors = normalize_native_calls(res.raw_calls)
+                content = res.content
+                if not calls and not errors:
+                    calls, content = extract_text_tool_calls(content)
+                await self.ui.content_end(content.strip())
+
+                if res.aborted and not calls:
+                    retries += 1
+                    why = {"repetition": "the model started repeating itself",
+                           "think_budget": "the model over-thought",
+                           "length": "the reply hit the length limit"}.get(res.aborted, res.aborted)
+                    if retries <= 3:
+                        await self.ui.notice(f"{why} — retrying with a focused prompt", "warn")
+                        step -= 1 if retries <= 2 else 0
+                        continue
+                    await self.ui.notice(f"{why}; stopping. Try rephrasing the request.", "error")
+                    break
+
+                if calls or errors:
+                    retries = 0
+                    self.messages.append({
+                        "role": "assistant", "content": content.strip(),
+                        "tool_calls": [{"function": c["function"]} for c in calls]})
+                    for err in errors:
+                        self.messages.append({"role": "tool", "content": f"ERROR: {err}"})
+                        await self.ui.notice(err, "warn")
+                    for i, call in enumerate(calls):
+                        if self._cancel:
+                            # keep history valid: every call gets a result
+                            for c in calls[i:]:
+                                self.messages.append({"role": "tool",
+                                                      "tool_name": c["function"]["name"],
+                                                      "content": "interrupted by the user"})
+                            break
+                        await self._run_call(call, recent)
+                    continue
+
+                text = content.strip()
+                if not text:
+                    retries += 1
+                    if retries <= 2:
+                        step -= 1
+                        continue
+                    text = "(no answer)"
+                self.messages.append({"role": "assistant", "content": text})
+                final_text = text
+                break
+            else:
+                await self.ui.notice(
+                    f"stopped after {self.cfg.max_steps} steps. Say 'continue' to keep going.",
+                    "warn")
+        except OllamaError as exc:
+            log(f"model error: {exc}")
+            await self.ui.notice(f"model error: {exc}", "error")
+        finally:
+            cp = self.tools.take_checkpoint()
+            if cp:
+                self.undo_stack.append(cp)
+                self.undo_stack = self.undo_stack[-20:]
+            self._stream = None
+            self.busy = False
+            if self._cancel:
+                await self.ui.notice("interrupted", "warn")
+        return final_text
+
+    async def _fit_context(self) -> None:
+        reserve = min(self.cfg.num_predict, self.cfg.num_ctx // 4) + 256
+        budget = int((self.cfg.num_ctx - reserve) / max(self.calib, 0.5))
+        if estimate_tokens(self.messages) <= budget:
+            return
+        self.messages, n = prune(self.messages, budget)
+        if n:
+            await self.ui.notice("context nearly full — trimmed old tool output", "dim")
+
+    async def _model_step(self, think: bool, nudge: Optional[str]) -> StepResult:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        DONE = object()
+        messages = self.messages
+        if nudge:
+            messages = messages + [{"role": "user", "content": f"[system note] {nudge}"}]
+        est = estimate_tokens(messages)
+
+        def producer() -> None:
+            try:
+                stream = self.client.chat_stream(messages, TOOL_SCHEMAS, think=think)
+                self._stream = stream
+                if self._cancel:
+                    stream.close()
+                for chunk in stream:
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
+            except Exception as exc:  # noqa: BLE001
+                loop.call_soon_threadsafe(queue.put_nowait, {"__error__": exc})
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, DONE)
+
+        threading.Thread(target=producer, daemon=True).start()
+        res = StepResult()
+        guard = RepetitionGuard()
+        content: list[str] = []
+        thinking: list[str] = []
+        think_start = 0.0
+        think_open = False
+        suppress = False   # hide raw text tool calls while streaming
+
+        while True:
+            chunk = await queue.get()
+            if chunk is DONE:
+                break
+            if "__error__" in chunk:
+                exc = chunk["__error__"]
+                if self._cancel:
+                    continue
+                raise exc if isinstance(exc, OllamaError) else OllamaError(str(exc))
+            msg = chunk.get("message") or {}
+            t = msg.get("thinking")
+            if t:
+                if not think_open:
+                    think_open = True
+                    think_start = time.monotonic()
+                thinking.append(t)
+                await self.ui.thinking_delta(t)
+                if guard.feed(t):
+                    res.aborted = "repetition"
+                elif sum(map(len, thinking)) > THINK_BUDGET_CHARS:
+                    res.aborted = "think_budget"
+            c = msg.get("content")
+            if c:
+                if think_open:
+                    think_open = False
+                    res.think_seconds = time.monotonic() - think_start
+                    await self.ui.thinking_end(res.think_seconds)
+                content.append(c)
+                so_far = "".join(content).lstrip()
+                if not suppress and (so_far.startswith(("<tool_call", "<function", "{\"name\"",
+                                                        "{'name'", "```json\n{\"name\""))
+                                     or "<tool_call>" in c):
+                    suppress = True
+                if not suppress:
+                    await self.ui.content_delta(c)
+                if guard.feed(c):
+                    res.aborted = "repetition"
+            if msg.get("tool_calls"):
+                res.raw_calls.extend(msg["tool_calls"])
+            if chunk.get("done"):
+                res.final = chunk
+                if chunk.get("done_reason") == "length" and not res.raw_calls:
+                    res.aborted = "length"
+            if res.aborted and self._stream is not None:
+                self._stream.close()
+            if self._cancel:
+                res.aborted = "cancel"
+                if self._stream is not None:
+                    self._stream.close()
+        if think_open:
+            res.think_seconds = time.monotonic() - think_start
+            await self.ui.thinking_end(res.think_seconds)
+        if self._cancel:
+            res.aborted = "cancel"
+        res.content = "".join(content)
+        res.thinking = "".join(thinking)
+
+        f = res.final
+        if f:
+            pin, pout = f.get("prompt_eval_count") or 0, f.get("eval_count") or 0
+            self.tokens_in += pin
+            self.tokens_out += pout
+            if pin:
+                self.last_prompt_tokens = pin + pout
+                if est > 200 and pin > 200:
+                    # learn the real chars-per-token ratio for this model
+                    self.calib = max(0.6, min(1.8, 0.7 * self.calib + 0.3 * (pin / est)))
+            dur = (f.get("eval_duration") or 0) / 1e9
+            await self.ui.stats({
+                "prompt_tokens": pin, "output_tokens": pout,
+                "tok_s": (pout / dur) if dur else 0.0,
+                "context": self.context_used(), "num_ctx": self.cfg.num_ctx})
+        return res
+
+    async def _run_call(self, call: dict, recent: dict[str, int]) -> None:
+        fn = call["function"]
+        name, args = fn["name"], fn.get("arguments") or {}
+        call_id = call.get("id") or ""
+        await self.ui.tool_start(call_id, name, args)
+        t0 = time.monotonic()
+
+        missing = missing_required(name, args)
+        if missing:
+            result = ToolResult(
+                f"ERROR: missing required argument(s) for {name}: {', '.join(missing)}. "
+                f"Call it again with all required arguments.", ok=False,
+                summary=f"missing {', '.join(missing)}")
+            await self._finish_call(call_id, name, args, result, t0)
+            return
+
+        sig = name + json.dumps(args, sort_keys=True, default=str)
+        recent[sig] = recent.get(sig, 0) + 1
+
+        needs, warning = self.tools.classify(name, args, self.mode)
+        diff, preview_err = ("", None)
+        if name in EDIT_TOOLS:
+            diff, preview_err = await asyncio.to_thread(self.tools.preview, name, args)
+        key = self._always_key(name, args)
+        if needs and not preview_err and not (key in self.always and not warning):
+            await self.ui.status(f"waiting for approval: {name}")
+            decision = await self.ui.approve(name, args, diff, warning)
+            if self._cancel:
+                decision = Decision(False, feedback="interrupted")
+            if not decision.allow:
+                fb = decision.feedback.strip()
+                out = "The user DENIED this action; it was not performed."
+                if fb:
+                    out += f" The user said: {fb}"
+                else:
+                    out += " Ask the user how to proceed or try a different approach."
+                await self._finish_call(call_id, name, args,
+                                        ToolResult(out, ok=False, summary="denied"), t0)
+                return
+            if decision.always:
+                self.always.add(key)
+
+        def on_out(text: str) -> None:
+            self.ui.tool_output(call_id, text)
+        self.tools.on_output = on_out
+        await self.ui.status(f"running {name}…")
+        try:
+            result = await asyncio.to_thread(self.tools.execute, name, args)
+        finally:
+            self.tools.on_output = None
+        if recent[sig] >= 3:
+            result.output += (f"\n\nNOTE: you have made this exact {name} call "
+                              f"{recent[sig]} times. Do something different, or finish.")
+        await self._finish_call(call_id, name, args, result, t0)
+
+    async def _finish_call(self, call_id: str, name: str, args: dict,
+                           result: ToolResult, t0: float) -> None:
+        self.messages.append({"role": "tool", "tool_name": name, "content": result.output})
+        await self.ui.tool_end(call_id, name, args, result, time.monotonic() - t0)
+
+    @staticmethod
+    def _always_key(name: str, args: dict) -> str:
+        if name in EDIT_TOOLS:
+            return "edit"
+        if name == "bash":
+            words = str(args.get("command", "")).split()
+            return "bash:" + (words[0] if words else "")
+        return name
+
+    # ------------------------------------------------------------ commands
+    def undo(self) -> list[str]:
+        if not self.undo_stack:
+            return []
+        cp = self.undo_stack.pop()
+        restored = self.tools.restore(cp)
+        if restored:
+            self.messages.append({"role": "user", "content":
+                                  "[The user reverted your file changes to: "
+                                  + ", ".join(restored) + ". They are back to their "
+                                  "previous state.]"})
+            self.messages.append({"role": "assistant", "content": "Noted — those changes were reverted."})
+        return restored
+
+    async def compact(self) -> str:
+        """Summarize the conversation with the model and restart from the summary."""
+        if len(self.messages) < 3:
+            return ""
+        transcript = transcript_for_summary(self.messages)
+        msgs = [{"role": "system", "content": "You summarize coding sessions precisely."},
+                {"role": "user", "content": f"{COMPACT_PROMPT}\n\n<conversation>\n{transcript}\n</conversation>"}]
+        summary = await asyncio.to_thread(self.client.complete, msgs, False, 1200)
+        if not summary:
+            raise OllamaError("the model returned an empty summary")
+        self.messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": "[Summary of our conversation so far]\n" + summary},
+            {"role": "assistant", "content": "Got it. I have the context and will continue from here."},
+        ]
+        self.last_prompt_tokens = 0
+        return summary
+
+    def load_messages(self, messages: list[dict]) -> None:
+        body = [m for m in messages if m.get("role") != "system"]
+        self.messages = [{"role": "system", "content": self.system_prompt}] + body

@@ -1,0 +1,309 @@
+"""Make a small model's tool calls robust.
+
+* native `tool_calls` are normalized (names + argument aliases + types)
+* when the model writes a tool call as text instead (`<tool_call>{...}`,
+  a ```json block, `{"name": ..., "arguments": ...}`), we recover it
+* repeated / looping output is detected so we can stop it early
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import uuid
+from typing import Any, Optional
+
+from .tools import TOOL_NAMES, TOOL_SCHEMAS
+
+NAME_ALIASES = {
+    "read": "read_file", "readfile": "read_file", "open_file": "read_file",
+    "view": "read_file", "cat": "read_file", "view_file": "read_file",
+    "write": "write_file", "create_file": "write_file", "writefile": "write_file",
+    "save_file": "write_file",
+    "edit": "edit_file", "replace": "edit_file", "str_replace": "edit_file",
+    "replace_in_file": "edit_file", "update_file": "edit_file",
+    "str_replace_editor": "edit_file", "modify_file": "edit_file",
+    "run_bash": "bash", "shell": "bash", "run": "bash", "execute": "bash",
+    "run_command": "bash", "exec": "bash", "terminal": "bash", "cmd": "bash",
+    "run_shell": "bash", "execute_command": "bash", "command": "bash",
+    "ls": "list_dir", "list": "list_dir", "list_files": "list_dir",
+    "list_directory": "list_dir", "tree": "list_dir", "dir": "list_dir",
+    "find": "glob", "find_files": "glob", "search_files": "glob", "file_search": "glob",
+    "search": "grep", "search_code": "grep", "rg": "grep", "ripgrep": "grep",
+    "grep_search": "grep", "code_search": "grep",
+    "todo": "todowrite", "todo_write": "todowrite", "todos": "todowrite",
+    "update_todos": "todowrite", "plan": "todowrite", "write_todos": "todowrite",
+    "fetch": "fetch_url", "web_fetch": "fetch_url", "http_get": "fetch_url",
+    "curl": "fetch_url", "webfetch": "fetch_url",
+}
+
+ARG_ALIASES = {
+    "path": ["file_path", "filepath", "file", "filename", "file_name", "target",
+             "directory", "dir", "folder", "target_file", "abs_path", "relative_path"],
+    "content": ["contents", "text", "data", "body", "code", "file_content", "new_content"],
+    "old_string": ["old", "old_str", "old_text", "search", "find", "original",
+                   "target_text", "from", "before"],
+    "new_string": ["new", "new_str", "new_text", "replacement", "replace", "to",
+                   "after", "updated"],
+    "command": ["cmd", "bash", "shell", "script", "commands", "command_line"],
+    "pattern": ["regex", "query", "glob", "search", "expr", "expression", "term"],
+    "include": ["glob_filter", "file_pattern", "files", "type", "filter"],
+    "url": ["link", "uri", "href", "address"],
+    "todos": ["items", "tasks", "todo", "list", "plan"],
+    "offset": ["start", "start_line", "line", "from_line"],
+    "limit": ["count", "lines", "num_lines", "max_lines"],
+    "replace_all": ["all", "global", "replaceall"],
+    "ignore_case": ["case_insensitive", "i", "nocase"],
+}
+
+_PROPS = {t["function"]["name"]: t["function"]["parameters"]["properties"]
+          for t in TOOL_SCHEMAS}
+
+
+def canonical_name(name: str) -> Optional[str]:
+    if not name:
+        return None
+    n = name.strip().lower().replace("-", "_").replace(" ", "_")
+    n = n.split(".")[-1]  # functions.read_file
+    if n in TOOL_NAMES:
+        return n
+    return NAME_ALIASES.get(n)
+
+
+def _coerce(value: Any, spec: dict) -> Any:
+    typ = spec.get("type")
+    try:
+        if typ == "integer":
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, str):
+                m = re.search(r"-?\d+", value)
+                return int(m.group()) if m else None
+            return int(value)
+        if typ == "boolean":
+            if isinstance(value, str):
+                return value.strip().lower() in ("true", "1", "yes", "y")
+            return bool(value)
+        if typ == "string":
+            if isinstance(value, (dict, list)):
+                return json.dumps(value)
+            return "" if value is None else str(value)
+        if typ == "array":
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                    return parsed if isinstance(parsed, list) else value
+                except ValueError:
+                    return value
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
+def normalize_args(name: str, args: Any) -> dict:
+    if isinstance(args, str):
+        args = loads_lenient(args)
+        if not isinstance(args, dict):
+            args = {}
+    if not isinstance(args, dict):
+        return {}
+    props = _PROPS.get(name, {})
+    out: dict = {}
+    # direct hits first
+    for k, v in args.items():
+        if k in props:
+            out[k] = v
+    for canon, alts in ARG_ALIASES.items():
+        if canon in props and canon not in out:
+            for a in alts:
+                if a in args and a not in props:
+                    out[canon] = args[a]
+                    break
+    # single-required-arg tools: accept whatever single value was given
+    req = [r for r in (t["function"]["parameters"]["required"]
+                       for t in TOOL_SCHEMAS if t["function"]["name"] == name)][0] \
+        if name in _PROPS else []
+    if len(req) == 1 and req[0] not in out and len(args) == 1:
+        out[req[0]] = next(iter(args.values()))
+    clean = {}
+    for k, v in out.items():
+        cv = _coerce(v, props.get(k, {}))
+        if cv is not None:
+            clean[k] = cv
+    return clean
+
+
+def loads_lenient(s: str) -> Any:
+    s = s.strip()
+    if not s:
+        return {}
+    try:
+        return json.loads(s)
+    except ValueError:
+        pass
+    # common small-model mistakes: trailing commas, single quotes, python bools
+    fixed = re.sub(r",\s*([}\]])", r"\1", s)
+    try:
+        return json.loads(fixed)
+    except ValueError:
+        pass
+    try:
+        import ast
+        obj = ast.literal_eval(fixed)
+        return obj
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        return None
+
+
+def _balanced_objects(text: str) -> list[tuple[int, int]]:
+    """Spans of top-level {...} objects (string-aware)."""
+    spans, depth, start, in_str, esc = [], 0, -1, False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                spans.append((start, i + 1))
+    return spans
+
+
+def _as_call(obj: Any) -> Optional[dict]:
+    if not isinstance(obj, dict):
+        return None
+    if "function" in obj and isinstance(obj["function"], dict):
+        obj = obj["function"]
+    name = obj.get("name") or obj.get("tool") or obj.get("tool_name") or obj.get("action")
+    if not isinstance(name, str):
+        return None
+    canon = canonical_name(name)
+    if not canon:
+        return None
+    args = obj.get("arguments", obj.get("parameters", obj.get("args",
+                   obj.get("input", obj.get("action_input")))))
+    if args is None:
+        args = {k: v for k, v in obj.items()
+                if k not in ("name", "tool", "tool_name", "action", "type")}
+    return {"id": "call_" + uuid.uuid4().hex[:8],
+            "function": {"name": canon, "arguments": normalize_args(canon, args)}}
+
+
+_TAGGED = re.compile(
+    r"<(tool_call|function_call|tool|invoke)>\s*(.*?)\s*</\1>", re.S | re.I)
+_FENCED = re.compile(r"```(?:json|tool_call|tool)?\s*\n(.*?)```", re.S)
+
+
+def extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
+    """Recover tool calls the model wrote as text. Returns (calls, remaining_text)."""
+    if not content or "{" not in content:
+        return [], content
+    calls: list[dict] = []
+    remaining = content
+
+    for m in list(_TAGGED.finditer(content)):
+        body = m.group(2)
+        found = False
+        for s, e in _balanced_objects(body):
+            c = _as_call(loads_lenient(body[s:e]))
+            if c:
+                calls.append(c)
+                found = True
+        if found:
+            remaining = remaining.replace(m.group(0), "")
+    if calls:
+        return calls, remaining.strip()
+
+    for m in list(_FENCED.finditer(content)):
+        body = m.group(1)
+        obj = loads_lenient(body)
+        objs = obj if isinstance(obj, list) else [obj]
+        got = [c for c in (_as_call(o) for o in objs) if c]
+        if got:
+            calls.extend(got)
+            remaining = remaining.replace(m.group(0), "")
+    if calls:
+        return calls, remaining.strip()
+
+    # bare JSON object(s) that look like a tool call
+    stripped = content.strip()
+    for s, e in _balanced_objects(stripped):
+        frag = stripped[s:e]
+        if '"name"' not in frag and "'name'" not in frag and '"tool"' not in frag:
+            continue
+        c = _as_call(loads_lenient(frag))
+        if c:
+            calls.append(c)
+            remaining = remaining.replace(frag, "")
+    return calls, remaining.strip()
+
+
+def normalize_native_calls(raw: list[dict]) -> tuple[list[dict], list[str]]:
+    """Normalize Ollama tool_calls. Returns (valid_calls, error_messages)."""
+    calls, errors = [], []
+    for c in raw or []:
+        fn = (c or {}).get("function") or {}
+        name = fn.get("name") or ""
+        canon = canonical_name(name)
+        if not canon:
+            errors.append(f"unknown tool '{name}'. Available tools: {', '.join(TOOL_NAMES)}")
+            continue
+        calls.append({"id": c.get("id") or "call_" + uuid.uuid4().hex[:8],
+                      "function": {"name": canon,
+                                   "arguments": normalize_args(canon, fn.get("arguments"))}})
+    return calls, errors
+
+
+def missing_required(name: str, args: dict) -> list[str]:
+    for t in TOOL_SCHEMAS:
+        if t["function"]["name"] == name:
+            return [r for r in t["function"]["parameters"]["required"] if r not in args]
+    return []
+
+
+class RepetitionGuard:
+    """Detects degenerate looping in streamed text (a common failure mode of
+    small models): the same chunk repeated many times at the tail."""
+
+    def __init__(self, window: int = 3000):
+        self.buf = ""
+        self.window = window
+        self._since = 0
+
+    def feed(self, text: str) -> bool:
+        self.buf = (self.buf + text)[-self.window:]
+        self._since += len(text)
+        if self._since < 120 or len(self.buf) < 600:
+            return False
+        self._since = 0
+        return looks_repetitive(self.buf)
+
+
+def looks_repetitive(buf: str) -> bool:
+    """True when the tail of buf is the same chunk repeated back-to-back."""
+    tail = buf[-2400:]
+    n = len(tail)
+    for period in range(8, 401):
+        reps = max(4, -(-600 // period))  # cover at least ~600 chars
+        if period * reps > n:
+            break
+        unit = tail[-period:]
+        if not unit.strip():
+            continue
+        if tail.endswith(unit * reps):
+            return True
+    lines = [l.strip() for l in tail.splitlines() if l.strip()]
+    if len(lines) >= 10 and len(set(lines[-10:])) == 1 and len(lines[-1]) > 6:
+        return True
+    return False
