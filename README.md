@@ -70,6 +70,8 @@ Then just ask:
 - **Context that doesn't overflow.** Old tool output is pruned automatically as the context window fills, the token estimate is calibrated against the model's real token counts, and `/compact` summarizes the conversation on demand.
 - **Fast.** The system prompt stays fixed for the whole session, so Ollama can reuse its cache between steps. Reasoning can be switched off with `ctrl+t`. The only dependency is Textual.
 
+**You see the work as it happens.** Files appear line by line with syntax highlighting while the model writes them. Edits show a side-by-side before/after diff. Command output streams live. The model says in one line what it's doing before each step. tinycode gets this by having the model write its tool calls as text, which streams token by token, instead of using Ollama's built-in tool calling, which holds a call back until it is finished. If you prefer the built-in tool calling, set `tool_mode = "native"`.
+
 **Safe by default.**
 - Every file edit shows a coloured diff before it is applied. You can answer *Yes*, *Yes, don't ask again*, or *No, and tell it what to do instead*.
 - Read-only commands (`ls`, `cat`, `git status`, `grep`, …) run without asking.
@@ -113,10 +115,11 @@ Then just ask:
 ```toml
 [model]
 model = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
-num_ctx = 16384        # lower if you're short on RAM, raise for big tasks
-num_predict = 4096
+num_ctx = 32768        # lower if you're short on RAM
+num_predict = 8192
 temperature = 0.6
 think = true           # reasoning: slower but more accurate
+tool_mode = "stream"   # stream: show work live · native: Ollama tool calling
 
 [agent]
 mode = "ask"           # ask | auto-edit | yolo

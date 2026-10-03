@@ -138,13 +138,13 @@ def loads_lenient(s: str) -> Any:
     if not s:
         return {}
     try:
-        return json.loads(s)
+        return json.loads(s, strict=False)
     except ValueError:
         pass
     # common small-model mistakes: trailing commas, single quotes, python bools
     fixed = re.sub(r",\s*([}\]])", r"\1", s)
     try:
-        return json.loads(fixed)
+        return json.loads(fixed, strict=False)
     except ValueError:
         pass
     try:
@@ -209,6 +209,8 @@ def extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
     """Recover tool calls the model wrote as text. Returns (calls, remaining_text)."""
     if not content or "{" not in content:
         return [], content
+    if content.count("<tool_call>") > content.count("</tool_call>"):
+        content = content.rstrip() + "\n</tool_call>"
     calls: list[dict] = []
     remaining = content
 
@@ -307,3 +309,99 @@ def looks_repetitive(buf: str) -> bool:
     if len(lines) >= 10 and len(set(lines[-10:])) == 1 and len(lines[-1]) > 6:
         return True
     return False
+
+
+# ----------------------------------------------------------- streaming mode
+# In "stream" tool mode the model writes calls as text, so we can show them
+# while they are being generated (Ollama holds native tool calls back).
+
+TOOL_RESPONSE_TAG = "<tool_response"
+
+
+def is_tool_result(m: dict) -> bool:
+    return m.get("role") == "tool" or (
+        m.get("role") == "user" and str(m.get("content", "")).startswith(TOOL_RESPONSE_TAG))
+
+
+_CALL_START = re.compile(r"<tool_call>|^\s*(?:```(?:json)?\s*)?\{\s*\"name\"\s*:", re.M)
+
+
+def tool_call_start(text: str) -> int:
+    """Index where a text tool call begins, or -1."""
+    m = _CALL_START.search(text)
+    return m.start() if m else -1
+
+
+def call_complete(text: str, start: int) -> bool:
+    """True once the JSON object after `start` is closed."""
+    brace = text.find("{", start)
+    if brace < 0:
+        return False
+    spans = _balanced_objects(text[brace:])
+    return bool(spans) and spans[0][0] == 0
+
+
+def _decode_partial(raw: str) -> str:
+    """Decode a JSON string body that may be cut off mid-way."""
+    out = []
+    i = 0
+    n = len(raw)
+    esc = {"n": "\n", "t": "\t", "r": "", '"': '"', "\\": "\\", "/": "/", "b": "", "f": ""}
+    while i < n:
+        ch = raw[i]
+        if ch == "\\":
+            if i + 1 >= n:
+                break
+            nx = raw[i + 1]
+            if nx == "u":
+                if i + 6 > n:
+                    break
+                try:
+                    out.append(chr(int(raw[i + 2:i + 6], 16)))
+                except ValueError:
+                    pass
+                i += 6
+                continue
+            out.append(esc.get(nx, nx))
+            i += 2
+            continue
+        if ch == '"':
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_STR_FIELD = r'"%s"\s*:\s*"'
+
+
+def partial_call(text: str) -> tuple[str, dict]:
+    """Best-effort (name, args) from an unfinished text tool call."""
+    start = tool_call_start(text)
+    if start < 0:
+        return "", {}
+    body = text[start:]
+    m = re.search(r'"name"\s*:\s*"([^"]*)"', body)
+    name = canonical_name(m.group(1)) or m.group(1) if m else ""
+    args: dict = {}
+    for key, aliases in (("path", ("path", "file_path", "file", "filename")),
+                         ("command", ("command", "cmd")),
+                         ("pattern", ("pattern",)), ("url", ("url",)),
+                         ("content", ("content", "contents", "text")),
+                         ("old_string", ("old_string", "old")),
+                         ("new_string", ("new_string", "new"))):
+        for a in aliases:
+            fm = re.search(_STR_FIELD % re.escape(a), body)
+            if fm:
+                args[key] = _decode_partial(body[fm.end():])
+                break
+    return name or "", args
+
+
+def unknown_tool_name(text: str) -> str:
+    """The name in a well-formed text tool call that isn't a known tool."""
+    for a, b in _balanced_objects(text):
+        obj = loads_lenient(text[a:b])
+        if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+            return "" if canonical_name(obj["name"]) else obj["name"]
+    return ""

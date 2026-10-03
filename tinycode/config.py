@@ -74,13 +74,17 @@ class Config:
     model_label: str = "Ling-3.0-tiny"
     host: str = "127.0.0.1:11434"
     # sampling / budget
-    num_ctx: int = 16384
-    num_predict: int = 4096          # hard cap per model step (stops runaway output)
+    num_ctx: int = 32768
+    num_predict: int = 8192          # hard cap per model step (stops runaway output)
     temperature: float = 0.6
     top_p: float = 0.95
     top_k: int = 20
     repeat_penalty: float = 1.05
     think: bool = True               # let the model reason before acting
+    # "stream": the model writes tool calls as text, so tinycode can show the
+    #           work (e.g. a file being written) live while it is generated.
+    # "native": Ollama's built-in tool calling (output hidden until complete).
+    tool_mode: str = "stream"
     # agent
     max_steps: int = 40
     max_tool_chars: int = 12000      # per tool result sent back to the model
@@ -164,6 +168,7 @@ def load_config(overrides: dict | None = None) -> Config:
                 except (TypeError, ValueError):
                     log(f"bad config value for {k}: {v!r}")
 
+    _migrate_config()
     apply(_read_toml(CONFIG_PATH))
     env = {}
     if os.environ.get("OLLAMA_HOST"):
@@ -176,15 +181,48 @@ def load_config(overrides: dict | None = None) -> Config:
     apply(overrides or {})
     if cfg.mode not in ("ask", "auto-edit", "yolo"):
         cfg.mode = "ask"
+    if cfg.tool_mode not in ("stream", "native"):
+        cfg.tool_mode = "stream"
     cfg.num_ctx = max(2048, cfg.num_ctx)
     return cfg
 
 
-DEFAULT_CONFIG_TOML = f"""# tinycode configuration
+DEFAULT_CONFIG_TOML = """# tinycode configuration
+# Everything is commented out, so tinycode's built-in defaults apply.
+# Uncomment a line and change it to override that setting.
+
+[model]
+# model = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
+# model_label = "Ling-3.0-tiny"
+# host = "127.0.0.1:11434"
+# num_ctx = 32768        # context window (tokens). Lower it if you run out of RAM.
+# num_predict = 8192     # max tokens per model step
+# temperature = 0.6
+# think = true           # reasoning before acting (slower, more accurate)
+# tool_mode = "stream"   # stream: show work live · native: Ollama tool calling
+
+[agent]
+# max_steps = 40
+# bash_timeout = 120
+# mode = "ask"           # ask | auto-edit | yolo
+
+[ollama]
+# manage_server = true        # start `ollama serve` automatically
+# stop_server_on_exit = true  # stop it again when tinycode quits
+# unload_on_exit = true       # free the model's RAM on quit
+
+[ui]
+# show_thinking = false
+# sidebar = true
+"""
+
+# The 2.0.0 template wrote every value out explicitly. If a user's file is
+# still exactly that, it holds no real choices: upgrade it so new defaults apply.
+_V200_TEMPLATE = """# tinycode configuration
 # Every key is optional; delete what you don't need.
 
 [model]
-model = "{DEFAULT_MODEL}"
+model = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
 model_label = "Ling-3.0-tiny"
 host = "127.0.0.1:11434"
 num_ctx = 16384        # context window (tokens). Lower it if you run out of RAM.
@@ -208,6 +246,15 @@ unload_on_exit = true       # free the model's RAM on quit
 show_thinking = false
 sidebar = true
 """
+
+
+def _migrate_config() -> None:
+    try:
+        if CONFIG_PATH.is_file() and CONFIG_PATH.read_text(encoding="utf-8") == _V200_TEMPLATE:
+            CONFIG_PATH.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
+            log("upgraded untouched 2.0.0 config to the new defaults")
+    except OSError:
+        pass
 
 
 def write_default_config() -> Path:

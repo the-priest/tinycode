@@ -119,8 +119,11 @@ TOOL_SCHEMAS: list[dict] = [
              "replace_all": {"type": "boolean", "description": "replace every occurrence"}},
             ["path", "old_string", "new_string"]),
     _schema("write_file",
-            "Create a new file, or completely overwrite one. Prefer edit_file for small changes.",
-            {"path": {"type": "string"}, "content": {"type": "string"}},
+            "Create a new file, or completely overwrite one. Prefer edit_file for small "
+            "changes. For big files (over ~150 lines) write the first part, then add the "
+            "rest in further calls with append=true.",
+            {"path": {"type": "string"}, "content": {"type": "string"},
+             "append": {"type": "boolean", "description": "add to the end instead of overwriting"}},
             ["path", "content"]),
     _schema("bash",
             "Run a shell command in the project root (each call starts there; use "
@@ -242,7 +245,10 @@ class Tools:
             p = self.resolve(args.get("path"))
             if name == "write_file":
                 before = p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
-                return unified_diff(before, str(args.get("content", "")), self.rel(p)), None
+                after = str(args.get("content", ""))
+                if args.get("append") and before:
+                    after = before + ("" if before.endswith("\n") else "\n") + after
+                return unified_diff(before, after, self.rel(p)), None
             if name == "edit_file":
                 if not p.is_file():
                     return "", f"no such file: {self.rel(p)}"
@@ -304,7 +310,7 @@ class Tools:
         out = _truncate(f"{header}\n{body}", self._limit())
         return ToolResult(out, summary=f"read {len(chunk)} lines", detail=body)
 
-    def t_write_file(self, path: str, content: str = "") -> ToolResult:
+    def t_write_file(self, path: str, content: str = "", append: bool = False) -> ToolResult:
         p = self.resolve(path)
         if p.is_dir():
             return ToolResult(f"ERROR: {self.rel(p)} is a directory.", ok=False,
@@ -312,6 +318,9 @@ class Tools:
         content = str(content)
         before = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
         existed = p.exists()
+        if append and existed:
+            sep = "" if not before or before.endswith("\n") else "\n"
+            content = before + sep + content
         self._record(p)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -319,9 +328,9 @@ class Tools:
         self._track(p, diff)
         self.read_files.add(str(p))
         n = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
-        verb = "overwrote" if existed else "created"
+        verb = "appended to" if (append and existed) else ("overwrote" if existed else "created")
         add, rem = diff_stats(diff)
-        return ToolResult(f"{verb} {self.rel(p)} ({n} lines)",
+        return ToolResult(f"{verb} {self.rel(p)} (now {n} lines)",
                           summary=f"{verb} · {n} lines (+{add} -{rem})", diff=diff)
 
     def t_edit_file(self, path: str, old_string: str = "", new_string: str = "",

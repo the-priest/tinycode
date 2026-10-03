@@ -215,7 +215,7 @@ esac
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
   "$VENV/bin/tinycode" config >/dev/null
   if [ "$MODEL" != "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL" ]; then
-    sed -i.bak "s|^model = .*|model = \"$MODEL\"|; s|^model_label = .*|model_label = \"${MODEL##*/}\"|" "$CONFIG_DIR/config.toml" && rm -f "$CONFIG_DIR/config.toml.bak"
+    sed -i.bak "s|^#\{0,1\} \{0,1\}model = .*|model = \"$MODEL\"|; s|^#\{0,1\} \{0,1\}model_label = .*|model_label = \"${MODEL##*/}\"|" "$CONFIG_DIR/config.toml" && rm -f "$CONFIG_DIR/config.toml.bak"
   fi
   ok "config → $CONFIG_DIR/config.toml"
 fi

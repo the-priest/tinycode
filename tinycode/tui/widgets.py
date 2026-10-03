@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from rich.console import Group
 from rich.markup import escape
+from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 from textual import events, on
 from textual.app import ComposeResult
@@ -196,18 +199,101 @@ class PromptInput(TextArea):
 
 # ------------------------------------------------------------- transcript
 
+def _code(code: str, path: str, start: int = 1) -> Syntax:
+    try:
+        lexer = Syntax.guess_lexer(path or "x.txt", code)
+    except Exception:  # noqa: BLE001
+        lexer = "text"
+    return Syntax(code, lexer, theme="monokai", line_numbers=True, start_line=start,
+                  background_color=T.BG, word_wrap=False, indent_guides=False)
+
+
+def _hunk_rows(diff: str) -> list[tuple]:
+    """Unified diff -> rows of (kind, old_no, old_text, new_no, new_text)."""
+    rows: list[tuple] = []
+    old_no = new_no = 0
+    rem: list[tuple[int, str]] = []
+    add: list[tuple[int, str]] = []
+
+    def flush() -> None:
+        for i in range(max(len(rem), len(add))):
+            o = rem[i] if i < len(rem) else (None, "")
+            n = add[i] if i < len(add) else (None, "")
+            rows.append(("chg", o[0], o[1], n[0], n[1]))
+        rem.clear()
+        add.clear()
+
+    for line in diff.splitlines():
+        if line.startswith(("---", "+++")):
+            continue
+        if line.startswith("@@"):
+            flush()
+            try:
+                parts = line.split()
+                old_no = int(parts[1].split(",")[0][1:])
+                new_no = int(parts[2].split(",")[0][1:])
+            except (IndexError, ValueError):
+                pass
+            if rows:
+                rows.append(("gap", None, "", None, ""))
+            continue
+        if line.startswith("-"):
+            rem.append((old_no, line[1:]))
+            old_no += 1
+        elif line.startswith("+"):
+            add.append((new_no, line[1:]))
+            new_no += 1
+        else:
+            flush()
+            rows.append(("ctx", old_no, line[1:], new_no, line[1:]))
+            old_no += 1
+            new_no += 1
+    flush()
+    return rows
+
+
+def render_split_diff(diff: str, max_rows: int = 60) -> Table:
+    """Side-by-side before | after view."""
+    tbl = Table(box=None, show_header=True, header_style=f"bold {T.MUTED}", expand=True,
+                padding=(0, 1), pad_edge=False)
+    tbl.add_column("", justify="right", style=T.DIM, width=5, no_wrap=True)
+    tbl.add_column("before", ratio=1, no_wrap=True, overflow="ellipsis")
+    tbl.add_column("", justify="right", style=T.DIM, width=5, no_wrap=True)
+    tbl.add_column("after", ratio=1, no_wrap=True, overflow="ellipsis")
+    rows = _hunk_rows(diff)
+    for kind, on, ot, nn, nt in rows[:max_rows]:
+        if kind == "gap":
+            tbl.add_row("", Text("⋮", style=T.DIM), "", Text("⋮", style=T.DIM))
+            continue
+        if kind == "ctx":
+            tbl.add_row(str(on), Text(ot, style=T.TEXT_SOFT), str(nn), Text(nt, style=T.TEXT_SOFT))
+            continue
+        left = Text(ot, style=f"{T.RED} on #2a1619") if on is not None else Text("")
+        right = Text(nt, style=f"{T.GREEN} on #16261a") if nn is not None else Text("")
+        tbl.add_row("" if on is None else str(on), left, "" if nn is None else str(nn), right)
+    if len(rows) > max_rows:
+        tbl.add_row("", Text(f"… {len(rows) - max_rows} more rows (ctrl+o)", style=T.MUTED), "", "")
+    return tbl
+
+
+def render_any_diff(diff: str, width: int, expanded: bool) -> Any:
+    if width >= 90:
+        return render_split_diff(diff, 400 if expanded else 40)
+    return render_diff(diff, 400 if expanded else 40)
+
+
 class ToolCallView(Vertical):
     """⏺ Edit(src/app.py)
-         ⎿ +3 -1  (diff / output below)"""
+         ⎿ +3 -1   then a diff, a code preview or the command output"""
 
     DEFAULT_CSS = f"""
     ToolCallView {{ height: auto; margin: 1 0 0 0; }}
     ToolCallView .tc-head {{ height: auto; }}
     ToolCallView .tc-sum {{ height: auto; color: {T.MUTED}; padding: 0 0 0 2; }}
-    ToolCallView .tc-body {{ height: auto; max-height: 24; padding: 0 0 0 4;
+    ToolCallView .tc-body {{ height: auto; max-height: 30; padding: 0 0 0 4;
                              color: {T.TEXT_SOFT}; overflow-y: auto; }}
-    ToolCallView .tc-body.-expanded {{ max-height: 200; }}
-    ToolCallView .tc-live {{ height: auto; max-height: 8; padding: 0 0 0 4; color: {T.MUTED}; }}
+    ToolCallView .tc-body.-expanded {{ max-height: 300; }}
+    ToolCallView .tc-live {{ height: auto; max-height: 24; padding: 0 0 0 4; color: {T.MUTED}; }}
     """
 
     def __init__(self, name: str, args: dict, expanded: bool = False) -> None:
@@ -233,12 +319,12 @@ class ToolCallView(Vertical):
         yield self.body
 
     def _head_text(self) -> Text:
-        color = {"running": T.YELLOW, "ok": T.GREEN, "error": T.RED,
+        color = {"running": T.YELLOW, "ok": T.GREEN, "error": T.RED, "writing": T.BLUE,
                  "denied": T.RED, "waiting": T.ORANGE}[self.state]
-        dot = "⏺" if not (self.state == "running" and self._blink_on) else "◯"
+        dot = "⏺" if not (self.state in ("running", "writing") and self._blink_on) else "◯"
         t = Text()
         t.append(f"{dot} ", style=color)
-        t.append(T.TOOL_LABELS.get(self.tool, self.tool), style=f"bold {T.TEXT}")
+        t.append(T.TOOL_LABELS.get(self.tool, self.tool or "Tool"), style=f"bold {T.TEXT}")
         target = tool_target(self.tool, self.args)
         if target:
             t.append("(", style=T.MUTED)
@@ -247,22 +333,56 @@ class ToolCallView(Vertical):
         return t
 
     def blink(self) -> None:
-        if self.state == "running":
+        if self.state in ("running", "writing"):
             self._blink_on = not self._blink_on
             self.head.update(self._head_text())
+
+    # -- live drafting (stream mode) -----------------------------------
+    def draft(self, name: str, args: dict) -> None:
+        """Show a tool call while the model is still writing it."""
+        self.state = "writing"
+        if name:
+            self.tool = name
+        self.args = {k: v for k, v in args.items()}
+        self.head.update(self._head_text())
+        code = args.get("content")
+        if code is None and self.tool == "edit_file":
+            code = args.get("new_string")
+        if isinstance(code, str) and code:
+            lines = code.split("\n")
+            tail = 18
+            start = max(0, len(lines) - tail)
+            self.live.display = True
+            self.live.update(_code("\n".join(lines[start:]), str(args.get("path", "")),
+                                   start + 1))
+            verb = "writing" if self.tool == "write_file" else "editing"
+            self.summary.update(Text(f"  ⎿ {verb}… {len(lines)} lines", style=T.BLUE))
+        else:
+            self.summary.update(Text("  ⎿ writing…", style=T.BLUE))
 
     def set_waiting(self) -> None:
         self.state = "waiting"
         self.head.update(self._head_text())
+        self.live.display = False
         self.summary.update(Text("  ⎿ waiting for your approval…", style=T.ORANGE))
+
+    def set_running(self, args: Optional[dict] = None) -> None:
+        self.state = "running"
+        if args is not None:
+            self.args = args
+        self.head.update(self._head_text())
+        self.live.display = False
+        self.live_lines = []
+        self.summary.update(Text("  ⎿ running…", style=T.MUTED))
 
     def add_live(self, text: str) -> None:
         self.state = "running"
         self.live_lines.extend(text.rstrip("\n").split("\n"))
-        self.live_lines = self.live_lines[-6:]
+        self.live_lines = self.live_lines[-10:]
         self.live.display = True
         self.live.update(Text("\n".join(short(l, 160) for l in self.live_lines), style=T.MUTED))
 
+    # -- result --------------------------------------------------------
     def finish(self, result: ToolResult, seconds: float) -> None:
         self.result = result
         denied = result.summary == "denied"
@@ -273,35 +393,60 @@ class ToolCallView(Vertical):
         summary = result.summary or ("done" if result.ok else result.output.split("\n")[0])
         s = Text("  ⎿ ", style=T.MUTED)
         s.append(short(summary, 140), style=color)
-        if seconds >= 1.0 and self.tool == "bash":
-            pass  # bash summary already carries its timing
-        has_body = bool(result.diff or (result.detail and self.tool not in ("todowrite",)))
-        if not result.ok and not result.diff:
-            has_body = True
-        if has_body and not result.diff:
-            s.append("  (ctrl+o to expand)" if not self.expanded else "", style=T.DIM)
+        if self._preview_lines() and not self.expanded:
+            s.append("  (ctrl+o for all)", style=T.DIM)
         self.summary.update(s)
         self._render_body()
+
+    def _preview_lines(self) -> int:
+        """How many lines are hidden behind ctrl+o."""
+        r = self.result
+        if r is None or r.diff or self.tool == "todowrite":
+            return 0
+        text = r.detail or ("" if r.ok else r.output)
+        n = text.count("\n") + 1 if text else 0
+        return n if n > 6 else 0
+
+    def _width(self) -> int:
+        try:
+            return self.size.width or self.app.size.width
+        except Exception:  # noqa: BLE001
+            return 80
 
     def _render_body(self) -> None:
         r = self.result
         if r is None:
             return
-        if r.diff:
-            self.body.update(render_diff(r.diff, 200 if self.expanded else 40))
-            self.body.display = True
-        elif not r.ok and r.output:
-            self.body.update(Text(r.output[:3000] if self.expanded else short_block(r.output, 8),
-                                  style=T.RED))
-            self.body.display = True
-        elif r.detail and self.expanded and self.tool != "todowrite":
-            self.body.update(Text(r.detail[:20000], style=T.TEXT_SOFT))
-            self.body.display = True
-        elif r.detail and self.tool == "bash":
-            self.body.update(Text(short_block(r.detail, 5), style=T.MUTED))
-            self.body.display = True
-        else:
+        body: Any = None
+        new_file = self.tool == "write_file" and r.ok and r.diff and \
+            "@@ -0,0 " in r.diff
+        if new_file:
+            code = str(self.args.get("content", ""))
+            if self.args.get("append"):
+                body = render_any_diff(r.diff, self._width(), self.expanded)
+            else:
+                lines = code.split("\n")
+                n = len(lines) if self.expanded else 20
+                body = _code("\n".join(lines[:n]), str(self.args.get("path", "")))
+                if len(lines) > n:
+                    body = Group(body, Text(f"   … {len(lines) - n} more lines (ctrl+o)",
+                                            style=T.MUTED))
+        elif r.diff:
+            body = render_any_diff(r.diff, self._width(), self.expanded)
+        elif r.detail or not r.ok:
+            text = (r.detail or r.output).expandtabs(4)
+            style = T.RED if not r.ok else T.MUTED
+            if self.tool == "todowrite":
+                body = None
+            elif self.expanded:
+                body = Text(text[:30000], style=style if not r.ok else T.TEXT_SOFT)
+            else:
+                body = Text(short_block(text, 6), style=style)
+        if body is None:
             self.body.display = False
+        else:
+            self.body.update(body)
+            self.body.display = True
         self.body.set_class(self.expanded, "-expanded")
 
     def set_expanded(self, on: bool) -> None:
@@ -319,7 +464,7 @@ def short_block(text: str, n: int) -> str:
 # ------------------------------------------------------------- modals
 
 class ApprovalScreen(ModalScreen):
-    """Claude-Code style permission prompt."""
+    """Permission prompt: yes / always / no with feedback."""
 
     DEFAULT_CSS = f"""
     ApprovalScreen {{ align: center bottom; background: {T.BG} 20%; }}
@@ -370,7 +515,7 @@ class ApprovalScreen(ModalScreen):
             yield Input(placeholder="what should tinycode do instead? (enter to send, empty = just deny)",
                         id="ap-fb")
 
-    def _body(self) -> Text:
+    def _body(self) -> Any:
         if self.tool == "bash":
             t = Text("$ ", style=T.GREEN)
             t.append(str(self.args.get("command", "")), style=f"bold {T.TEXT}")
@@ -378,6 +523,12 @@ class ApprovalScreen(ModalScreen):
         path = str(self.args.get("path", ""))
         head = Text(path + "\n", style=f"bold {T.CYAN}")
         if self.diff:
+            try:
+                wide = self.app.size.width >= 100
+            except Exception:  # noqa: BLE001
+                wide = False
+            if wide:
+                return Group(head, render_split_diff(self.diff, 400))
             head.append_text(render_diff(self.diff, 400))
         elif self.tool == "write_file":
             head.append(str(self.args.get("content", ""))[:6000], style=T.TEXT_SOFT)

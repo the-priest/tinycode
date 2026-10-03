@@ -15,9 +15,10 @@ from .config import Config, log
 from .context import (COMPACT_PROMPT, build_system_prompt, estimate_tokens, prune,
                       transcript_for_summary)
 from .ollama import ChatStream, Ollama, OllamaError
-from .parsing import (RepetitionGuard, extract_text_tool_calls, missing_required,
-                      normalize_native_calls)
-from .tools import EDIT_TOOLS, TOOL_SCHEMAS, ToolResult, Tools
+from .parsing import (RepetitionGuard, call_complete, extract_text_tool_calls,
+                      missing_required, normalize_native_calls, partial_call,
+                      tool_call_start, unknown_tool_name)
+from .tools import EDIT_TOOLS, TOOL_NAMES, TOOL_SCHEMAS, ToolResult, Tools
 
 THINK_BUDGET_CHARS = 12000   # ~3k tokens of reasoning per step is plenty
 
@@ -48,6 +49,14 @@ class AgentUI:
     async def stats(self, info: dict) -> None: ...
     async def todos(self, todos: list[dict]) -> None: ...
     async def status(self, text: str) -> None: ...
+    async def tool_draft(self, name: str, args: dict) -> None:
+        """A tool call is being written (stream mode): partial name/args so far."""
+
+    async def generating(self, seconds: float, est_tokens: int, started: bool) -> None:
+        """Nothing has streamed for a while. Either the model is still reading
+        its context (started=False), or it is producing output we can't see
+        yet: Ollama holds back a tool call until it is complete (e.g. a whole
+        file for write_file)."""
 
 
 @dataclass
@@ -57,6 +66,7 @@ class StepResult:
     raw_calls: list = field(default_factory=list)
     final: dict = field(default_factory=dict)
     aborted: str = ""        # "", cancel, repetition, think_budget, length
+    call_started: bool = False   # stream mode: a text tool call was begun
     think_seconds: float = 0.0
 
 
@@ -67,7 +77,7 @@ class Agent:
         self.workdir = workdir
         self.ui = ui
         self.tools = Tools(workdir, cfg, on_todos=self._on_todos)
-        self.system_prompt, self.memory_files = build_system_prompt(workdir)
+        self.system_prompt, self.memory_files = build_system_prompt(workdir, cfg.tool_mode)
         self.messages: list[dict] = [{"role": "system", "content": self.system_prompt}]
         self.mode = cfg.mode
         self.think = cfg.think
@@ -82,6 +92,8 @@ class Agent:
         self.tokens_out = 0
         self.calib = 1.0
         self.turn_started = 0.0
+        self.rate = 10.0          # measured output speed, tokens/s
+        self.stream_tools = cfg.tool_mode == "stream"
 
     # ----------------------------------------------------------- utilities
     def _on_todos(self, todos: list[dict]) -> None:
@@ -90,7 +102,7 @@ class Agent:
             asyncio.run_coroutine_threadsafe(self.ui.todos(todos), loop)
 
     def reset(self) -> None:
-        self.system_prompt, self.memory_files = build_system_prompt(self.workdir)
+        self.system_prompt, self.memory_files = build_system_prompt(self.workdir, self.cfg.tool_mode)
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self.tools.todos = []
         self.tools.read_files.clear()
@@ -98,7 +110,7 @@ class Agent:
         self.last_prompt_tokens = 0
 
     def refresh_system_prompt(self) -> None:
-        self.system_prompt, self.memory_files = build_system_prompt(self.workdir)
+        self.system_prompt, self.memory_files = build_system_prompt(self.workdir, self.cfg.tool_mode)
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = {"role": "system", "content": self.system_prompt}
 
@@ -124,6 +136,7 @@ class Agent:
         final_text = ""
         recent: dict[str, int] = {}
         retries = 0
+        last_abort = ""
         step = 0
         try:
             while step < self.cfg.max_steps:
@@ -134,7 +147,12 @@ class Agent:
                 await self._fit_context()
                 think = self.think and retries == 0
                 nudge = None
-                if retries >= 2:
+                if last_abort == "length":
+                    nudge = ("Your previous reply was cut off by the length limit before it "
+                             "finished. Do the work in smaller steps: write big files in parts "
+                             "of at most ~150 lines (write_file, then write_file with "
+                             "append=true for each next part).")
+                elif retries >= 2:
                     nudge = ("Your previous attempt failed (it got stuck or was empty). "
                              "Respond now: either call ONE tool, or give the final answer "
                              "in a few sentences.")
@@ -150,8 +168,21 @@ class Agent:
                 content = res.content
                 if not calls and not errors:
                     calls, content = extract_text_tool_calls(content)
+                    if self.stream_tools:
+                        calls = calls[:1]   # one call per step; the rest is guesswork
+                    if res.call_started and not calls and not self._cancel:
+                        start = tool_call_start(res.content)
+                        content = res.content[:start] if start >= 0 else ""
+                        bad = unknown_tool_name(res.content[start:] if start >= 0 else "")
+                        errors = [f"unknown tool '{bad}'. Available tools: "
+                                  + ", ".join(TOOL_NAMES)] if bad else \
+                            ["your tool call could not be parsed. Send it again as "
+                                  "<tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call> "
+                                  "with valid JSON (escape \" and newlines inside strings) and an "
+                                  "existing tool name."]
                 await self.ui.content_end(content.strip())
 
+                last_abort = res.aborted if not calls else ""
                 if res.aborted and not calls:
                     retries += 1
                     why = {"repetition": "the model started repeating itself",
@@ -166,19 +197,15 @@ class Agent:
 
                 if calls or errors:
                     retries = 0
-                    self.messages.append({
-                        "role": "assistant", "content": content.strip(),
-                        "tool_calls": [{"function": c["function"]} for c in calls]})
+                    self._record_assistant(content.strip(), calls, res.content)
                     for err in errors:
-                        self.messages.append({"role": "tool", "content": f"ERROR: {err}"})
-                        await self.ui.notice(err, "warn")
+                        self._add_result("", f"ERROR: {err}")
+                        await self.ui.notice(err.split(".")[0], "warn")
                     for i, call in enumerate(calls):
                         if self._cancel:
                             # keep history valid: every call gets a result
                             for c in calls[i:]:
-                                self.messages.append({"role": "tool",
-                                                      "tool_name": c["function"]["name"],
-                                                      "content": "interrupted by the user"})
+                                self._add_result(c["function"]["name"], "interrupted by the user")
                             break
                         await self._run_call(call, recent)
                     continue
@@ -231,7 +258,12 @@ class Agent:
 
         def producer() -> None:
             try:
-                stream = self.client.chat_stream(messages, TOOL_SCHEMAS, think=think)
+                if self.stream_tools:
+                    stream = self.client.chat_stream(
+                        messages, None, think=think,
+                        options={"stop": ["</tool_call>", "<tool_response>"]})
+                else:
+                    stream = self.client.chat_stream(messages, TOOL_SCHEMAS, think=think)
                 self._stream = stream
                 if self._cancel:
                     stream.close()
@@ -251,10 +283,31 @@ class Agent:
         think_open = False
         suppress = False   # hide raw text tool calls while streaming
 
+        started = time.monotonic()
+        last_chunk = started
+        visible_tokens = 0
+        shown = 0            # chars of content already sent to the UI
+        call_at = -1
+        last_draft = 0.0
+        call_done = False
         while True:
-            chunk = await queue.get()
+            try:
+                chunk = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                idle = time.monotonic() - last_chunk
+                if idle >= 2.0 and not self._cancel:
+                    # silent generation (tool-call arguments): estimate progress
+                    await self.ui.generating(idle, int(idle * self.rate), visible_tokens > 0)
+                continue
             if chunk is DONE:
                 break
+            now = time.monotonic()
+            m = chunk.get("message") or {}
+            if m.get("thinking") or m.get("content"):
+                visible_tokens += 1      # Ollama streams ~1 token per chunk
+                if now - started > 3 and visible_tokens > 20:
+                    self.rate = 0.8 * self.rate + 0.2 * (visible_tokens / (now - started))
+            last_chunk = now
             if "__error__" in chunk:
                 exc = chunk["__error__"]
                 if self._cancel:
@@ -279,17 +332,42 @@ class Agent:
                     res.think_seconds = time.monotonic() - think_start
                     await self.ui.thinking_end(res.think_seconds)
                 content.append(c)
-                so_far = "".join(content).lstrip()
-                if not suppress and (so_far.startswith(("<tool_call", "<function", "{\"name\"",
-                                                        "{'name'", "```json\n{\"name\""))
-                                     or "<tool_call>" in c):
-                    suppress = True
+                so_far = "".join(content)
                 if not suppress:
-                    await self.ui.content_delta(c)
-                if guard.feed(c):
+                    start = tool_call_start(so_far)
+                    if start < 0 and so_far.lstrip().startswith(("<function", "{'name'")):
+                        start = len(so_far) - len(so_far.lstrip())
+                    if start >= 0:
+                        suppress = True
+                        call_at = start
+                        res.call_started = True
+                        before = so_far[:start][shown:]
+                        if before.strip():
+                            await self.ui.content_delta(before)
+                    else:
+                        # hold back a possible partial "<tool_call" at the very end
+                        safe = len(so_far)
+                        lt = so_far.rfind("<", max(0, len(so_far) - 12))
+                        if lt >= 0 and "<tool_call>".startswith(so_far[lt:]):
+                            safe = lt
+                        if safe > shown:
+                            await self.ui.content_delta(so_far[shown:safe])
+                            shown = safe
+                if suppress:
+                    if now - last_draft > 0.08:
+                        last_draft = now
+                        name, args = partial_call(so_far)
+                        await self.ui.tool_draft(name, args)
+                    if self.stream_tools and call_complete(so_far, call_at):
+                        call_done = True   # stop here: one call per step
+                        if self._stream is not None:
+                            self._stream.close()
+                elif guard.feed(c):
                     res.aborted = "repetition"
             if msg.get("tool_calls"):
                 res.raw_calls.extend(msg["tool_calls"])
+            if call_done:
+                continue
             if chunk.get("done"):
                 res.final = chunk
                 if chunk.get("done_reason") == "length" and not res.raw_calls:
@@ -308,7 +386,13 @@ class Agent:
         res.content = "".join(content)
         res.thinking = "".join(thinking)
 
+        if call_done:
+            name, args = partial_call(res.content)
+            await self.ui.tool_draft(name, args)
         f = res.final
+        if not f and visible_tokens:
+            f = {"eval_count": visible_tokens,
+                 "eval_duration": int((time.monotonic() - started) * 1e9)}
         if f:
             pin, pout = f.get("prompt_eval_count") or 0, f.get("eval_count") or 0
             self.tokens_in += pin
@@ -319,6 +403,8 @@ class Agent:
                     # learn the real chars-per-token ratio for this model
                     self.calib = max(0.6, min(1.8, 0.7 * self.calib + 0.3 * (pin / est)))
             dur = (f.get("eval_duration") or 0) / 1e9
+            if dur > 1 and pout > 20:
+                self.rate = pout / dur
             await self.ui.stats({
                 "prompt_tokens": pin, "output_tokens": pout,
                 "tok_s": (pout / dur) if dur else 0.0,
@@ -380,9 +466,35 @@ class Agent:
                               f"{recent[sig]} times. Do something different, or finish.")
         await self._finish_call(call_id, name, args, result, t0)
 
+    def _record_assistant(self, text: str, calls: list[dict], raw: str) -> None:
+        if not self.stream_tools:
+            self.messages.append({"role": "assistant", "content": text,
+                                  "tool_calls": [{"function": c["function"]} for c in calls]})
+            return
+        # stream mode: keep the history in the exact text format we ask for
+        parts = [text] if text else []
+        for c in calls:
+            parts.append("<tool_call>\n" + json.dumps(
+                {"name": c["function"]["name"], "arguments": c["function"]["arguments"]},
+                ensure_ascii=False) + "\n</tool_call>")
+        if not calls and raw.strip():
+            parts = [raw.strip()]
+        self.messages.append({"role": "assistant", "content": "\n".join(parts)})
+
+    def _add_result(self, name: str, output: str) -> None:
+        if self.stream_tools:
+            tag = f'<tool_response name="{name}">' if name else "<tool_response>"
+            self.messages.append({"role": "user",
+                                  "content": f"{tag}\n{output}\n</tool_response>"})
+        else:
+            msg = {"role": "tool", "content": output}
+            if name:
+                msg["tool_name"] = name
+            self.messages.append(msg)
+
     async def _finish_call(self, call_id: str, name: str, args: dict,
                            result: ToolResult, t0: float) -> None:
-        self.messages.append({"role": "tool", "tool_name": name, "content": result.output})
+        self._add_result(name, result.output)
         await self.ui.tool_end(call_id, name, args, result, time.monotonic() - t0)
 
     @staticmethod

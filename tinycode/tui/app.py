@@ -27,6 +27,7 @@ from ..agent import Agent, AgentUI, Decision
 from ..config import Config, log, log_path, write_default_config
 from ..context import expand_mentions, git_branch
 from ..ollama import Ollama, OllamaError
+from ..parsing import extract_text_tool_calls, is_tool_result
 from ..session import Session, ago, list_sessions
 from ..tools import IGNORED_DIRS, ToolResult
 from . import theme as T
@@ -86,8 +87,10 @@ class Bridge(AgentUI):
         self.md_text: list[str] = []
         self.tool_views: dict[str, ToolCallView] = {}
         self.live_tokens = 0
+        self.draft_view: Optional[ToolCallView] = None
 
     def _reset_step(self) -> None:
+        self.draft_view = None
         self.think_box = self.think_body = None
         self.think_buf = []
         self.md = self.md_row = None
@@ -95,6 +98,8 @@ class Bridge(AgentUI):
         self.md_text = []
 
     async def step_start(self, step: int) -> None:
+        self.live_tokens += self.app.gen_estimate
+        self.app.gen_estimate = 0
         self._reset_step()
         self.app.step = step
         self.app.set_activity("Thinking" if self.app.agent.think else "Working")
@@ -105,13 +110,15 @@ class Bridge(AgentUI):
         if self.think_box is None:
             self.think_body = Static("", classes="think-body")
             self.think_box = Collapsible(self.think_body, title="∴ Thinking…",
-                                         collapsed=not self.app.show_thinking,
-                                         classes="think")
+                                         collapsed=False, classes="think")
             await self.app.emit(self.think_box)
         now = time.monotonic()
-        if now - self.think_paint > 0.12 and self.think_body is not None:
+        if now - self.think_paint > 0.1 and self.think_body is not None:
             self.think_paint = now
-            self.think_body.update(Text("".join(self.think_buf).strip(), style=f"italic {T.MUTED}"))
+            full = "".join(self.think_buf).strip()
+            if not self.app.show_thinking:
+                full = "\n".join(full.split("\n")[-6:])   # live tail
+            self.think_body.update(Text(full, style=f"italic {T.MUTED}"))
             last = "".join(self.think_buf).strip().split("\n")[-1]
             self.app.set_activity("Thinking", short(last, 70))
 
@@ -119,6 +126,7 @@ class Bridge(AgentUI):
         if self.think_box is not None and self.think_body is not None:
             self.think_body.update(Text("".join(self.think_buf).strip(), style=f"italic {T.MUTED}"))
             self.think_box.title = f"∴ Thought for {seconds:.1f}s"
+            self.think_box.collapsed = not self.app.show_thinking
         self.app.set_activity("Writing")
 
     async def content_delta(self, text: str) -> None:
@@ -150,11 +158,32 @@ class Bridge(AgentUI):
                 await self.md.update(final_text)
         self.md_text = []
 
+    async def tool_draft(self, name: str, args: dict) -> None:
+        if self.draft_view is None:
+            self.draft_view = ToolCallView(name or "", args, expanded=self.app.expanded)
+            await self.app.emit(self.draft_view)
+            self.app.current_tool = self.draft_view
+        self.draft_view.draft(name, args)
+        self.app.gen_estimate = int(sum(len(str(v)) for v in args.values()) / 3.5)
+        label = T.TOOL_LABELS.get(name, name or "tool call")
+        path = args.get("path") or args.get("command") or ""
+        self.app.set_activity(f"Writing {label}", short(str(path), 50))
+
     async def tool_start(self, call_id: str, name: str, args: dict) -> None:
-        view = ToolCallView(name, args, expanded=self.app.expanded)
+        self.live_tokens += self.app.gen_estimate
+        self.app.gen_estimate = 0
+        view = self.draft_view
+        self.draft_view = None
+        if view is not None and view.tool in (name, ""):
+            view.tool = name
+            view.set_running(args)
+        else:
+            if view is not None:
+                await view.remove()
+            view = ToolCallView(name, args, expanded=self.app.expanded)
+            await self.app.emit(view)
         self.tool_views[call_id] = view
         self.app.current_tool = view
-        await self.app.emit(view)
         self.app.set_activity(f"Running {T.TOOL_LABELS.get(name, name)}",
                               short(tool_target(name, args), 60))
 
@@ -198,6 +227,18 @@ class Bridge(AgentUI):
             self.app.notify(f"won't ask again {label}", timeout=3)
             return Decision(True, always=True)
         return Decision(choice == "yes", feedback=feedback or "")
+
+    async def generating(self, seconds: float, est_tokens: int, started: bool) -> None:
+        if not started:
+            self.app.set_activity("Reading", "processing the conversation…")
+            return
+        if self.think_box is not None and self.think_box.title.startswith("∴ Thinking"):
+            self.think_box.title = "∴ Thought"
+            self.think_box.collapsed = not self.app.show_thinking
+        self.app.gen_estimate = est_tokens
+        self.app.set_activity(
+            "Writing", f"~{fmt_k(est_tokens)} tokens so far — the model shows a tool call "
+                       "once it's complete")
 
     async def notice(self, text: str, level: str = "info") -> None:
         color = {"info": T.TEXT_SOFT, "warn": T.YELLOW, "error": T.RED,
@@ -307,6 +348,7 @@ class TinyCodeApp(App):
         self.activity_detail = ""
         self.boot_status = "starting…"
         self.last_stats: dict = {}
+        self.gen_estimate = 0
         self.queue: list[str] = []
         self.current_tool: Optional[ToolCallView] = None
         self.pending_approval: Optional[asyncio.Future] = None
@@ -466,7 +508,8 @@ class TinyCodeApp(App):
             t.append(f"{self.activity}…", style=f"bold {T.ORANGE}")
             if self.activity_detail:
                 t.append(f" {self.activity_detail}", style=T.MUTED)
-            t.append(f"  ({el:.0f}s · ↓ {fmt_k(self.bridge.live_tokens)} tokens · esc to interrupt)",
+            t.append(f"  ({el:.0f}s · ↓ {fmt_k(self.bridge.live_tokens + self.gen_estimate)} tokens"
+                     " · esc to interrupt)",
                      style=T.DIM)
             st.update(t)
         elif not self.ready:
@@ -575,8 +618,26 @@ class TinyCodeApp(App):
         pending: list[ToolCallView] = []
         for m in messages:
             role = m.get("role")
-            if role == "user":
-                await self.emit_user(str(m.get("content", ""))[:2000])
+            content = str(m.get("content", ""))
+            if role == "user" and content.startswith("<tool_response"):
+                if pending:
+                    v = pending.pop(0)
+                    body = content.split("\n", 1)[-1].rsplit("</tool_response>", 1)[0].strip()
+                    v.finish(ToolResult(body, ok=not body.startswith("ERROR"),
+                                        summary=short(body.split("\n")[0], 100)), 0)
+            elif role == "user":
+                await self.emit_user(content[:2000])
+            elif role == "assistant" and "<tool_call>" in content:
+                calls, text = extract_text_tool_calls(content)
+                if text:
+                    await self.emit(Horizontal(Static("⏺", classes="answer-dot"),
+                                               Markdown(text, classes="answer"),
+                                               classes="answer-row"))
+                for c in calls:
+                    fn = c["function"]
+                    v = ToolCallView(fn["name"], fn["arguments"])
+                    await self.emit(v)
+                    pending.append(v)
             elif role == "assistant":
                 for tc in m.get("tool_calls") or []:
                     fn = tc.get("function") or {}
@@ -742,6 +803,7 @@ class TinyCodeApp(App):
 
     async def _turn(self, text: str) -> None:
         self.bridge.live_tokens = 0
+        self.gen_estimate = 0
         self._turn_start = time.monotonic()
         self.query_one("#prompt-box").add_class("-busy")
         await self.emit_user(text)
@@ -1161,7 +1223,9 @@ class TinyCodeApp(App):
         out = [f"# tinycode session {self.session.id}\n"]
         for m in self.agent.messages[1:]:
             role = m.get("role")
-            if role == "user":
+            if is_tool_result(m):
+                out.append("```\n" + str(m.get("content", ""))[:3000] + "\n```\n")
+            elif role == "user":
                 out.append(f"## You\n\n{m.get('content', '')}\n")
             elif role == "assistant":
                 for tc in m.get("tool_calls") or []:

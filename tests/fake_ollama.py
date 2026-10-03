@@ -78,6 +78,15 @@ class FakeOllama:
                 reply: Any = outer.replies.pop(0) if outer.replies else {"content": "Done."}
                 if callable(reply):
                     reply = reply(payload["messages"])
+                reply = dict(reply)
+                if reply.get("tool_calls") and not payload.get("tools") \
+                        and not reply.get("native"):
+                    # no native tools requested: the model writes the call as text
+                    text = "".join(
+                        "\n<tool_call>\n" + json.dumps(tc) + "\n</tool_call>"
+                        for tc in reply.pop("tool_calls"))
+                    reply["content"] = (reply.get("content") or "") + text
+                    reply["pause"] = 0
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-ndjson")
                 self.end_headers()
@@ -101,6 +110,8 @@ class FakeOllama:
                         if not send({"content": "", key: text[i:i + size]}
                                     if key == "thinking" else {"content": text[i:i + size]}):
                             return
+                if reply.get("pause"):
+                    time.sleep(reply["pause"])   # silent generation (tool-call args)
                 if reply.get("tool_calls"):
                     if not send({"content": "", "tool_calls": [
                             {"function": tc} for tc in reply["tool_calls"]]}):

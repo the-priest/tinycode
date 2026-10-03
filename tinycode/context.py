@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .parsing import is_tool_result
 from .tools import IGNORED_DIRS, TOOL_SCHEMAS
 
 MEMORY_FILES = ("TINYCODE.md", "AGENTS.md", "CLAUDE.md", ".tinycode/instructions.md")
@@ -32,6 +33,7 @@ SYSTEM_PROMPT = """You are tinycode, an expert software engineer working as a co
 - edit_file: copy old_string exactly from the file WITHOUT the line-number prefix, with 2-3 lines of context so it is unique.
 - Paths are relative to the project root.
 - Multi-step task (3+ steps): call todowrite first, then keep statuses updated.
+- Big new files: write them in parts of at most ~150 lines (write_file, then write_file with append=true for each next part). Never put a whole large file in one call.
 - If a tool returns ERROR, read the message and correct your next call. Don't repeat a failing call unchanged.
 - Never invent file contents, command output or results.
 - Simple questions that need no files: answer directly, no tools.
@@ -95,13 +97,49 @@ def load_memory(cwd: Path, max_chars: int = 6000) -> tuple[str, list[str]]:
     return text, used
 
 
-def build_system_prompt(cwd: Path) -> tuple[str, list[str]]:
+def tools_prompt() -> str:
+    """Tool instructions for "stream" tool mode, where calls are plain text."""
+    lines = []
+    for t in TOOL_SCHEMAS:
+        f = t["function"]
+        props = f["parameters"]["properties"]
+        req = set(f["parameters"]["required"])
+        sig = ", ".join(k + ("" if k in req else "?") for k in props)
+        lines.append(f"- {f['name']}({sig}): {f['description']}")
+    return TOOLS_SECTION.format(tools="\n".join(lines))
+
+
+TOOLS_SECTION = """
+
+# Tools
+To use a tool, first write ONE short sentence saying what you are doing, then the call in exactly this format:
+<tool_call>
+{{"name": "TOOL_NAME", "arguments": {{"arg": "value"}}}}
+</tool_call>
+Then STOP. The result comes back to you inside <tool_response>…</tool_response>. Never write a <tool_response> yourself.
+- One tool call per reply. The arguments must be valid JSON: escape double quotes as \\" and newlines as \\n inside strings.
+- When the task is finished, reply normally without any tool call.
+
+Available tools (? = optional):
+{tools}
+
+Example:
+Let me look at the main module first.
+<tool_call>
+{{"name": "read_file", "arguments": {{"path": "src/main.py"}}}}
+</tool_call>"""
+
+
+def build_system_prompt(cwd: Path, tool_mode: str = "stream") -> tuple[str, list[str]]:
     memory, used = load_memory(cwd)
     mem = f"\n\n# Project instructions (follow these)\n{memory}" if memory else ""
     osname = f"{platform.system()} {platform.release()}".strip()
-    return SYSTEM_PROMPT.format(
+    prompt = SYSTEM_PROMPT.format(
         cwd=str(cwd), os=osname, date=time.strftime("%Y-%m-%d"),
-        git=_git_info(cwd), listing=_listing(cwd), memory=mem), used
+        git=_git_info(cwd), listing=_listing(cwd), memory="")
+    if tool_mode == "stream":
+        prompt += tools_prompt()
+    return prompt + mem, used
 
 
 # ------------------------------------------------------------ token budget
@@ -121,6 +159,12 @@ def estimate_tokens(messages: list[dict], with_tools: bool = True) -> int:
 PRUNED = "[older tool output removed to save context — call the tool again if needed]"
 
 
+def _pruned_like(m: dict) -> str:
+    if m.get("role") == "user":
+        return f"<tool_response>\n{PRUNED}\n</tool_response>"
+    return PRUNED
+
+
 def prune(messages: list[dict], budget: int, keep_recent_tools: int = 4) -> tuple[list[dict], int]:
     """Shrink history to fit `budget` tokens. Cheapest first:
     1. blank out old tool results (keeping the most recent few),
@@ -131,10 +175,10 @@ def prune(messages: list[dict], budget: int, keep_recent_tools: int = 4) -> tupl
     if estimate_tokens(msgs) <= budget:
         return msgs, 0
 
-    tool_idx = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
+    tool_idx = [i for i, m in enumerate(msgs) if is_tool_result(m)]
     for i in tool_idx[:-keep_recent_tools] if keep_recent_tools else tool_idx:
-        if msgs[i].get("content") != PRUNED and len(msgs[i].get("content") or "") > 200:
-            msgs[i]["content"] = PRUNED
+        if PRUNED not in (msgs[i].get("content") or "") and len(msgs[i].get("content") or "") > 200:
+            msgs[i]["content"] = _pruned_like(msgs[i])
             changes += 1
             if estimate_tokens(msgs) <= budget:
                 return msgs, changes
@@ -158,14 +202,17 @@ def prune(messages: list[dict], budget: int, keep_recent_tools: int = 4) -> tupl
     # drop oldest turns (a turn starts at a user message), keep the latest one
     system = msgs[0] if msgs and msgs[0].get("role") == "system" else None
     body = msgs[1:] if system else msgs
-    user_starts = [i for i, m in enumerate(body) if m.get("role") == "user"]
+    user_starts = [i for i, m in enumerate(body)
+                   if m.get("role") == "user" and not is_tool_result(m)]
     dropped_users: list[str] = []
     while len(user_starts) > 1 and estimate_tokens(([system] if system else []) + body) > budget:
         cut = user_starts[1]
         dropped_users += [str(m.get("content", ""))[:160] for m in body[:cut]
-                          if m.get("role") == "user" and not str(m.get("content", "")).startswith("[")]
+                          if m.get("role") == "user" and not is_tool_result(m)
+                          and not str(m.get("content", "")).startswith("[")]
         body = body[cut:]
-        user_starts = [i for i, m in enumerate(body) if m.get("role") == "user"]
+        user_starts = [i for i, m in enumerate(body)
+                       if m.get("role") == "user" and not is_tool_result(m)]
         changes += 1
     if dropped_users:
         note = {"role": "user", "content":
@@ -175,9 +222,9 @@ def prune(messages: list[dict], budget: int, keep_recent_tools: int = 4) -> tupl
         body = [note, assistant_ack] + body
     # last resort: blank all tool outputs except the very last one
     if estimate_tokens(([system] if system else []) + body) > budget:
-        tools = [i for i, m in enumerate(body) if m.get("role") == "tool"]
+        tools = [i for i, m in enumerate(body) if is_tool_result(m)]
         for i in tools[:-1]:
-            body[i] = dict(body[i], content=PRUNED)
+            body[i] = dict(body[i], content=_pruned_like(body[i]))
             changes += 1
     return ([system] if system else []) + body, changes
 
@@ -198,7 +245,7 @@ def transcript_for_summary(messages: list[dict], max_chars: int = 30000) -> str:
         if role == "system":
             continue
         c = str(m.get("content") or "")
-        if role == "tool":
+        if is_tool_result(m):
             c = c[:800]
             out.append(f"[tool result]\n{c}")
         elif role == "assistant":
