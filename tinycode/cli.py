@@ -285,8 +285,11 @@ def update() -> int:
     ref = os.environ.get("TINYCODE_REF", "main")
     url = f"https://github.com/the-priest/tinycode/archive/refs/heads/{ref}.tar.gz"
     print(f"updating tinycode from {url}")
-    return subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade",
-                            "--disable-pip-version-check", "-q", url])
+    # Reinstall unconditionally and skip pip's cache: a republished branch keeps
+    # the same version number, so `--upgrade` alone would say "already satisfied"
+    # and never replace the code.
+    return subprocess.call([sys.executable, "-m", "pip", "install", "--force-reinstall",
+                            "--no-cache-dir", "--disable-pip-version-check", "-q", url])
 
 
 # ------------------------------------------------------------------ main
