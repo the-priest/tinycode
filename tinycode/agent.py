@@ -20,7 +20,6 @@ from .parsing import (RepetitionGuard, call_complete, extract_text_tool_calls,
                       tool_call_start, unknown_tool_name)
 from .tools import EDIT_TOOLS, TOOL_NAMES, TOOL_SCHEMAS, ToolResult, Tools
 
-THINK_BUDGET_CHARS = 12000   # ~3k tokens of reasoning per step is plenty
 
 
 @dataclass
@@ -49,6 +48,9 @@ class AgentUI:
     async def stats(self, info: dict) -> None: ...
     async def todos(self, todos: list[dict]) -> None: ...
     async def status(self, text: str) -> None: ...
+    async def step_discarded(self) -> None:
+        """The current step's output is being thrown away and redone."""
+
     async def tool_draft(self, name: str, args: dict) -> None:
         """A tool call is being written (stream mode): partial name/args so far."""
 
@@ -148,10 +150,9 @@ class Agent:
                 think = self.think and retries == 0
                 nudge = None
                 if last_abort == "length":
-                    nudge = ("Your previous reply was cut off by the length limit before it "
-                             "finished. Do the work in smaller steps: write big files in parts "
-                             "of at most ~150 lines (write_file, then write_file with "
-                             "append=true for each next part).")
+                    nudge = ("Your previous reply hit the length limit before it finished. "
+                             "Try again. If a file is very large you can write it in "
+                             "several calls using write_file with append=true.")
                 elif retries >= 2:
                     nudge = ("Your previous attempt failed (it got stuck or was empty). "
                              "Respond now: either call ONE tool, or give the final answer "
@@ -172,14 +173,27 @@ class Agent:
                         calls = calls[:1]   # one call per step; the rest is guesswork
                     if res.call_started and not calls and not self._cancel:
                         start = tool_call_start(res.content)
-                        content = res.content[:start] if start >= 0 else ""
                         bad = unknown_tool_name(res.content[start:] if start >= 0 else "")
-                        errors = [f"unknown tool '{bad}'. Available tools: "
-                                  + ", ".join(TOOL_NAMES)] if bad else \
-                            ["your tool call could not be parsed. Send it again as "
-                                  "<tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call> "
-                                  "with valid JSON (escape \" and newlines inside strings) and an "
-                                  "existing tool name."]
+                        if bad:
+                            content = res.content[:start]
+                            errors = [f"unknown tool '{bad}'. Available tools: "
+                                      + ", ".join(TOOL_NAMES)]
+                        elif self.stream_tools:
+                            # A format we can't read. Don't make the model pay
+                            # for it: switch to Ollama's own tool-call parser
+                            # (it knows the model's native format) and redo the step.
+                            log("unparsed text tool call, switching to native tool calling:\n"
+                                + res.content[-4000:])
+                            await self.ui.content_end(res.content[:start].strip() if start >= 0
+                                                      else "")
+                            await self.ui.step_discarded()
+                            self.set_tool_mode("native")
+                            await self.ui.notice(
+                                "the model used a tool-call format tinycode can't show live — "
+                                "switched to Ollama's built-in tool calling for this session",
+                                "dim")
+                            step -= 1
+                            continue
                 await self.ui.content_end(content.strip())
 
                 last_abort = res.aborted if not calls else ""
@@ -323,8 +337,6 @@ class Agent:
                 await self.ui.thinking_delta(t)
                 if guard.feed(t):
                     res.aborted = "repetition"
-                elif sum(map(len, thinking)) > THINK_BUDGET_CHARS:
-                    res.aborted = "think_budget"
             c = msg.get("content")
             if c:
                 if think_open:
@@ -465,6 +477,11 @@ class Agent:
             result.output += (f"\n\nNOTE: you have made this exact {name} call "
                               f"{recent[sig]} times. Do something different, or finish.")
         await self._finish_call(call_id, name, args, result, t0)
+
+    def set_tool_mode(self, mode: str) -> None:
+        self.cfg.tool_mode = mode
+        self.stream_tools = mode == "stream"
+        self.refresh_system_prompt()
 
     def _record_assistant(self, text: str, calls: list[dict], raw: str) -> None:
         if not self.stream_tools:

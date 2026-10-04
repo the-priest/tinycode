@@ -81,10 +81,10 @@ class Config:
     top_k: int = 20
     repeat_penalty: float = 1.05
     think: bool = True               # let the model reason before acting
-    # "stream": the model writes tool calls as text, so tinycode can show the
-    #           work (e.g. a file being written) live while it is generated.
-    # "native": Ollama's built-in tool calling (output hidden until complete).
-    tool_mode: str = "stream"
+    # "native": Ollama's built-in tool calling (default, most reliable).
+    # "stream": experimental — the model writes tool calls as text so files can
+    #           be shown live while generated.
+    tool_mode: str = "native"
     # agent
     max_steps: int = 40
     max_tool_chars: int = 12000      # per tool result sent back to the model
@@ -182,7 +182,7 @@ def load_config(overrides: dict | None = None) -> Config:
     if cfg.mode not in ("ask", "auto-edit", "yolo"):
         cfg.mode = "ask"
     if cfg.tool_mode not in ("stream", "native"):
-        cfg.tool_mode = "stream"
+        cfg.tool_mode = "native"
     cfg.num_ctx = max(2048, cfg.num_ctx)
     return cfg
 
@@ -199,7 +199,7 @@ DEFAULT_CONFIG_TOML = """# tinycode configuration
 # num_predict = 8192     # max tokens per model step
 # temperature = 0.6
 # think = true           # reasoning before acting (slower, more accurate)
-# tool_mode = "stream"   # stream: show work live · native: Ollama tool calling
+# tool_mode = "native"   # native: Ollama tool calling · stream: experimental live view
 
 [agent]
 # max_steps = 40

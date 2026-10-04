@@ -57,3 +57,20 @@ def test_repetition():
     for _ in range(200):
         hit = hit or g.feed("wait, let me re-check. ")
     assert hit
+
+
+
+def test_many_text_formats():
+    from tinycode.parsing import extract_text_tool_calls
+    cases = [
+        '<tool_call>\n<function=write_file>\n<parameter=path>\na.html\n</parameter>\n'
+        '<parameter=content>\n<p class="x">hi</p>\n</parameter>\n</function>\n</tool_call>',
+        '<tool_call>\n{"name": "write_file", "arguments": {"path": "a.html", '
+        '"content": "<p class="x">hi</p>"}}\n</tool_call>',
+        '<invoke name="write_file"><parameter name="path">a.html</parameter>'
+        '<parameter name="content"><p class="x">hi</p></parameter></invoke>',
+    ]
+    for c in cases:
+        calls, _ = extract_text_tool_calls(c)
+        assert calls[0]["function"]["arguments"] == {"path": "a.html",
+                                                     "content": '<p class="x">hi</p>'}, c

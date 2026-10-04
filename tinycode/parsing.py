@@ -185,7 +185,8 @@ def _as_call(obj: Any) -> Optional[dict]:
         return None
     if "function" in obj and isinstance(obj["function"], dict):
         obj = obj["function"]
-    name = obj.get("name") or obj.get("tool") or obj.get("tool_name") or obj.get("action")
+    name = obj.get("name") or obj.get("tool") or obj.get("tool_name") or obj.get("action") \
+        or (obj.get("function") if isinstance(obj.get("function"), str) else None)
     if not isinstance(name, str):
         return None
     canon = canonical_name(name)
@@ -195,19 +196,142 @@ def _as_call(obj: Any) -> Optional[dict]:
                    obj.get("input", obj.get("action_input")))))
     if args is None:
         args = {k: v for k, v in obj.items()
-                if k not in ("name", "tool", "tool_name", "action", "type")}
+                if k not in ("name", "tool", "tool_name", "action", "type", "function")}
     return {"id": "call_" + uuid.uuid4().hex[:8],
             "function": {"name": canon, "arguments": normalize_args(canon, args)}}
 
 
 _TAGGED = re.compile(
-    r"<(tool_call|function_call|tool|invoke)>\s*(.*?)\s*</\1>", re.S | re.I)
+    r"<(tool_call|function_call|tool|invoke|tool_use)\b[^>]*>\s*(.*?)\s*</\1>", re.S | re.I)
 _FENCED = re.compile(r"```(?:json|tool_call|tool)?\s*\n(.*?)```", re.S)
+_XML_FUNC = re.compile(r"<function=([\w.\-]+)>(.*?)(?:</function>|$)", re.S)
+_XML_PARAM = re.compile(r"<parameter=([\w\-]+)>\n?(.*?)\n?</parameter>", re.S)
+_INVOKE = re.compile(r"<invoke\s+name=[\"']([\w.\-]+)[\"']\s*>(.*?)(?:</invoke>|$)", re.S)
+_INVOKE_PARAM = re.compile(r"<parameter\s+name=[\"']([\w\-]+)[\"']\s*>(.*?)</parameter>", re.S)
+_ARG_PAIR = re.compile(r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>", re.S)
+
+
+def _mk(name: str, args: Any) -> Optional[dict]:
+    canon = canonical_name(name or "")
+    if not canon:
+        return None
+    return {"id": "call_" + uuid.uuid4().hex[:8],
+            "function": {"name": canon, "arguments": normalize_args(canon, args)}}
+
+
+def _xmlish_value(v: str) -> Any:
+    v2 = v.strip()
+    if v2.startswith(("[", "{")):
+        parsed = loads_lenient(v2)
+        if parsed is not None:
+            return parsed
+    return v[1:] if v.startswith("\n") else v
+
+
+def _decode_loose(raw: str) -> str:
+    """Decode JSON escapes in a string body without stopping at bare quotes."""
+    out, i, n = [], 0, len(raw)
+    esc = {"n": "\n", "t": "\t", "r": "", '"': '"', "\\": "\\", "/": "/", "b": "", "f": ""}
+    while i < n:
+        ch = raw[i]
+        if ch == "\\" and i + 1 < n:
+            nx = raw[i + 1]
+            if nx == "u" and i + 6 <= n:
+                try:
+                    out.append(chr(int(raw[i + 2:i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    pass
+            out.append(esc.get(nx, "\\" + nx))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def salvage_json_call(text: str) -> Optional[dict]:
+    """Recover a JSON tool call that json can't parse, typically because a
+    file's contents contain unescaped quotes."""
+    m = re.search(r'"(?:name|tool|tool_name|function)"\s*:\s*"([\w.\-]+)"', text)
+    if not m:
+        return None
+    canon = canonical_name(m.group(1))
+    if not canon:
+        return None
+    props = _PROPS.get(canon, {})
+    keys = set(props)
+    for canon_key, alts in ARG_ALIASES.items():
+        if canon_key in props:
+            keys.update(alts)
+    starts = []
+    for k in keys:
+        for fm in re.finditer(r'"%s"\s*:\s*' % re.escape(k), text):
+            starts.append((fm.start(), fm.end(), k))
+    starts.sort()
+    args: dict = {}
+    for i, (s0, s1, k) in enumerate(starts):
+        nxt = starts[i + 1][0] if i + 1 < len(starts) else len(text)
+        chunk = text[s1:nxt]
+        if chunk.startswith('"'):
+            body = chunk[1:]
+            if i + 1 < len(starts):
+                body = re.sub(r'"\s*,\s*$', "", body.rstrip())
+            else:
+                body = re.sub(r'"\s*}\s*}?\s*(?:</tool_call>)?\s*$', "", body.rstrip())
+            args[k] = _decode_loose(body)
+        else:
+            vm = re.match(r"\s*(true|false|-?\d+)", chunk)
+            if vm:
+                args[k] = vm.group(1)
+    if not args:
+        return None
+    return _mk(canon, args)
+
+
+def parse_call_text(body: str) -> Optional[dict]:
+    """Parse one tool call written in any common text format."""
+    body = body.strip()
+    if not body:
+        return None
+    # 1. JSON object(s)
+    for s, e in _balanced_objects(body):
+        obj = loads_lenient(body[s:e])
+        c = _as_call(obj)
+        if c:
+            return c
+    # 2. <function=name><parameter=k>v</parameter></function>
+    fm = _XML_FUNC.search(body)
+    if fm:
+        args = {k: _xmlish_value(v) for k, v in _XML_PARAM.findall(fm.group(2))}
+        return _mk(fm.group(1), args)
+    # 3. <invoke name="x"><parameter name="k">v</parameter></invoke>
+    im = _INVOKE.search(body)
+    if im:
+        args = {k: _xmlish_value(v) for k, v in _INVOKE_PARAM.findall(im.group(2))}
+        return _mk(im.group(1), args)
+    # 4. name on the first line, then <arg_key>/<arg_value> pairs or JSON args
+    first, _, rest = body.partition("\n")
+    head = re.match(r"\s*([\w.\-]+)\s*(\(|$|\{)", first)
+    if head and canonical_name(head.group(1)):
+        pairs = _ARG_PAIR.findall(body)
+        if pairs:
+            return _mk(head.group(1), {k: _xmlish_value(v) for k, v in pairs})
+        tail = body[head.end(1):].strip().lstrip("(").rstrip(")")
+        for s, e in _balanced_objects(tail):
+            obj = loads_lenient(tail[s:e])
+            if isinstance(obj, dict):
+                return _mk(head.group(1), obj)
+    # 5. broken JSON
+    if "{" in body:
+        return salvage_json_call(body)
+    return None
 
 
 def extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
     """Recover tool calls the model wrote as text. Returns (calls, remaining_text)."""
-    if not content or "{" not in content:
+    if not content or not re.search(r"[{<]", content):
         return [], content
     if content.count("<tool_call>") > content.count("</tool_call>"):
         content = content.rstrip() + "\n</tool_call>"
@@ -215,17 +339,21 @@ def extract_text_tool_calls(content: str) -> tuple[list[dict], str]:
     remaining = content
 
     for m in list(_TAGGED.finditer(content)):
-        body = m.group(2)
-        found = False
-        for s, e in _balanced_objects(body):
-            c = _as_call(loads_lenient(body[s:e]))
-            if c:
-                calls.append(c)
-                found = True
-        if found:
+        c = parse_call_text(m.group(2) if m.group(1).lower() != "invoke" else m.group(0))
+        if c:
+            calls.append(c)
             remaining = remaining.replace(m.group(0), "")
     if calls:
         return calls, remaining.strip()
+
+    for rx in (_XML_FUNC, _INVOKE):
+        for m in list(rx.finditer(content)):
+            c = parse_call_text(m.group(0))
+            if c:
+                calls.append(c)
+                remaining = remaining.replace(m.group(0), "")
+        if calls:
+            return calls, remaining.strip()
 
     for m in list(_FENCED.finditer(content)):
         body = m.group(1)
@@ -323,7 +451,10 @@ def is_tool_result(m: dict) -> bool:
         m.get("role") == "user" and str(m.get("content", "")).startswith(TOOL_RESPONSE_TAG))
 
 
-_CALL_START = re.compile(r"<tool_call>|^\s*(?:```(?:json)?\s*)?\{\s*\"name\"\s*:", re.M)
+_CALL_START = re.compile(
+    r"<tool_call>|<function=[\w.\-]+>|<invoke\s+name=|"
+    r"^\s*(?:```(?:json)?\s*)?\{\s*\"(?:name|tool|function)\"\s*:", re.M)
+_CALL_END = re.compile(r"</tool_call>|</function>|</invoke>")
 
 
 def tool_call_start(text: str) -> int:
@@ -333,12 +464,23 @@ def tool_call_start(text: str) -> int:
 
 
 def call_complete(text: str, start: int) -> bool:
-    """True once the JSON object after `start` is closed."""
-    brace = text.find("{", start)
+    """True once the tool call that begins at `start` is finished."""
+    body = text[start:]
+    if _CALL_END.search(body):
+        return True
+    brace = body.find("{")
     if brace < 0:
         return False
-    spans = _balanced_objects(text[brace:])
-    return bool(spans) and spans[0][0] == 0
+    spans = _balanced_objects(body[brace:])
+    if not spans or spans[0][0] != 0:
+        return False
+    # only trust a closed brace if it really parses (unescaped quotes in a
+    # file's contents can fool the brace counter)
+    try:
+        json.loads(body[brace:brace + spans[0][1]], strict=False)
+        return True
+    except ValueError:
+        return False
 
 
 def _decode_partial(raw: str) -> str:
@@ -381,25 +523,43 @@ def partial_call(text: str) -> tuple[str, dict]:
     if start < 0:
         return "", {}
     body = text[start:]
-    m = re.search(r'"name"\s*:\s*"([^"]*)"', body)
-    name = canonical_name(m.group(1)) or m.group(1) if m else ""
+    name = ""
+    for rx in (r'"(?:name|tool|tool_name|function)"\s*:\s*"([^"]+)"', r"<function=([\w.\-]+)>",
+               r"<invoke\s+name=[\"']([\w.\-]+)", r"<tool_call>\s*([\w.\-]+)\s*(?:\n|\(|\{|<)"):
+        m = re.search(rx, body)
+        if m:
+            name = m.group(1)
+            break
+    name = canonical_name(name) or name
     args: dict = {}
-    for key, aliases in (("path", ("path", "file_path", "file", "filename")),
-                         ("command", ("command", "cmd")),
-                         ("pattern", ("pattern",)), ("url", ("url",)),
-                         ("content", ("content", "contents", "text")),
-                         ("old_string", ("old_string", "old")),
-                         ("new_string", ("new_string", "new"))):
+    fields = (("path", ("path", "file_path", "file", "filename")),
+              ("command", ("command", "cmd")),
+              ("pattern", ("pattern",)), ("url", ("url",)),
+              ("content", ("content", "contents", "text")),
+              ("old_string", ("old_string", "old")),
+              ("new_string", ("new_string", "new")))
+    for key, aliases in fields:
         for a in aliases:
             fm = re.search(_STR_FIELD % re.escape(a), body)
             if fm:
                 args[key] = _decode_partial(body[fm.end():])
+                break
+            xm = re.search(r"<(?:parameter=%s|parameter\s+name=[\"']%s[\"']|arg_value)>\n?"
+                           % (re.escape(a), re.escape(a)), body) if a != "text" else None
+            if xm and (a in xm.group(0)):
+                val = body[xm.end():]
+                end = val.find("</parameter>")
+                args[key] = val if end < 0 else val[:end]
                 break
     return name or "", args
 
 
 def unknown_tool_name(text: str) -> str:
     """The name in a well-formed text tool call that isn't a known tool."""
+    m = re.search(r"<function=([\w.\-]+)>|<invoke\s+name=[\"']([\w.\-]+)", text)
+    if m:
+        n = m.group(1) or m.group(2)
+        return "" if canonical_name(n) else n
     for a, b in _balanced_objects(text):
         obj = loads_lenient(text[a:b])
         if isinstance(obj, dict) and isinstance(obj.get("name"), str):

@@ -170,7 +170,7 @@ async def test_length_cutoff_retries_with_parts_hint(project):
         agent = make(project, fake)
         await agent.run("make a big page")
         hint = fake.requests[1]["messages"][-1]["content"]
-    assert "append=true" in hint and "cut off" in hint
+    assert "length limit" in hint
 
 
 def test_write_file_append(project):
@@ -221,7 +221,7 @@ async def test_stream_mode_shows_draft_and_stops_after_call(project):
                {"content": "done"}]
     with FakeOllama(replies, delay=0.004) as fake:
         ui = UI()
-        agent = make(project, fake, ui, mode="yolo")
+        agent = make(project, fake, ui, mode="yolo", tool_mode="stream")
         await agent.run("page")
         assert "tools" not in fake.requests[0]
         assert "</tool_call>" in fake.requests[0]["options"]["stop"]
@@ -233,15 +233,18 @@ async def test_stream_mode_shows_draft_and_stops_after_call(project):
     assert assistant.startswith("Writing the page.") and "made this up" not in assistant
 
 
-async def test_stream_mode_bad_json_gets_feedback(project):
-    replies = [{"content": '<tool_call>\n{"name": "read_file", "arguments": {"path": }}\n</tool_call>'},
-               {"content": '<tool_call>\n{"name": "read_file", "arguments": {"path": "README.md"}}\n</tool_call>'},
+async def test_stream_mode_unreadable_call_falls_back_to_native(project):
+    replies = [{"content": '<tool_call>\n%%%% garbled %%%%\n</tool_call>'},
+               {"tool_calls": [{"name": "read_file", "arguments": {"path": "README.md"}}],
+                "native": True},
                {"content": "ok"}]
     with FakeOllama(replies) as fake:
-        agent = make(project, fake)
+        agent = make(project, fake, tool_mode="stream")
         assert await agent.run("x") == "ok"
+        assert "tools" not in fake.requests[0] and fake.requests[1].get("tools")
+    assert agent.cfg.tool_mode == "native"
     results = [m["content"] for m in agent.messages if is_tool_result(m)]
-    assert "could not be parsed" in results[0] and "tiny calculator" in results[1]
+    assert len(results) == 1 and "tiny calculator" in results[0]
 
 
 
@@ -249,7 +252,7 @@ async def test_stream_mode_unknown_tool_reported(project):
     replies = [{"content": '<tool_call>\n{"name": "teleport", "arguments": {}}\n</tool_call>'},
                {"content": "ok"}]
     with FakeOllama(replies) as fake:
-        agent = make(project, fake)
+        agent = make(project, fake, tool_mode="stream")
         await agent.run("x")
     results = [m["content"] for m in agent.messages if is_tool_result(m)]
     assert "unknown tool 'teleport'" in results[0]
