@@ -88,6 +88,8 @@ class Config:
     # agent
     max_steps: int = 40
     max_tool_chars: int = 12000      # per tool result sent back to the model
+    auto_check: bool = True          # syntax/error check after every file change
+    check_rounds: int = 3            # max automatic "fix the remaining errors" rounds
     bash_timeout: int = 120
     # permissions: "ask" | "auto-edit" | "yolo"
     mode: str = "ask"
@@ -203,6 +205,7 @@ DEFAULT_CONFIG_TOML = """# tinycode configuration
 
 [agent]
 # max_steps = 40
+# auto_check = true      # check syntax after every edit and before finishing
 # bash_timeout = 120
 # mode = "ask"           # ask | auto-edit | yolo
 

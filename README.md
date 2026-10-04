@@ -61,6 +61,19 @@ Then just ask:
 
 ## What makes it good
 
+**Catches its own bugs while it works.** Every time the model writes or edits a file, tinycode runs a fast local check on it and puts the result straight into the tool output, with the line number and the offending line, so the model fixes it in its next step:
+
+| Language | Check |
+|---|---|
+| Python | syntax (built-in compiler), undefined names and similar real bugs (`ruff`, or `pyflakes`, if installed) |
+| JavaScript | `node --check` |
+| HTML | unclosed and mismatched tags, plus `node --check` on every inline `<script>`, using the file's own line numbers |
+| TypeScript | syntax errors (`tsc`) |
+| CSS · JSON · TOML · YAML | braces, comments and parse errors |
+| Shell · C/C++ · Go · PHP · Ruby | `bash -n`, `gcc -fsyntax-only`, `gofmt -e`, `php -l`, `ruby -c` |
+
+A file that is still being written in chunks is reported as "unfinished, keep going", not as an error. When the model says it's done, every file it changed is checked again. If anything is still broken, the errors go back to it to fix, for a few rounds at most. The sidebar's **PROBLEMS** panel shows what's open, and the model can also run the `check` tool itself on a file or the whole project. A checker whose tool isn't installed is skipped. tinycode also detects the project type and its test command (pytest, npm test, cargo test, go test…) and tells the model.
+
 **Built for a small local model.** Small models make small mistakes. tinycode catches them so a task doesn't fail on one bad tool call:
 
 - **Forgiving edits.** If `old_string` doesn't match exactly, edits still land when the only problem is indentation, whitespace or line numbers copied from `read_file`. The fix is re-indented to fit the file. An edit that is ambiguous or can't be found is never guessed. Instead the model gets back the closest matching region of the file so it can try again.
@@ -104,7 +117,7 @@ Then just ask:
 
 ## Tools the model can use
 
-`read_file` · `edit_file` · `write_file` · `bash` · `glob` · `grep` · `list_dir` · `todowrite` · `fetch_url`
+`read_file` · `edit_file` · `write_file` · `bash` · `check` · `glob` · `grep` · `list_dir` · `todowrite` · `fetch_url`
 
 `glob`, `grep` and `list_dir` skip `.git`, `node_modules`, virtualenvs and build folders. `grep` uses ripgrep when it is installed.
 
@@ -124,6 +137,7 @@ tool_mode = "native"   # native: Ollama tool calling · stream: experimental liv
 [agent]
 mode = "ask"           # ask | auto-edit | yolo
 max_steps = 40
+auto_check = true     # check every edited file, and again before finishing
 
 [ollama]
 manage_server = true

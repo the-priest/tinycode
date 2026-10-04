@@ -322,3 +322,59 @@ def test_changed_file_is_read_again(project):
     assert "changed" in t.t_read_file("calc.py").output
     assert "has not changed" in t.t_read_file("calc.py").output
     assert "1\tchanged" in t.t_read_file("calc.py", offset=1, limit=1).output
+
+
+async def test_auto_check_reports_errors_in_tool_result(project):
+    replies = [
+        {"tool_calls": [{"name": "write_file", "arguments": {
+            "path": "bad.py", "content": "def f(x):\n    return x +\n"}}]},
+        {"tool_calls": [{"name": "edit_file", "arguments": {
+            "path": "bad.py", "old_string": "return x +", "new_string": "return x + 1"}}]},
+        {"content": "fixed"},
+    ]
+    with FakeOllama(replies) as fake:
+        agent = make(project, fake, mode="yolo")
+        assert await agent.run("x") == "fixed"
+    results = [m["content"] for m in agent.messages if is_tool_result(m)]
+    assert "Automatic check found 1 problem" in results[0] and "line 2" in results[0]
+    assert "no problems found" in results[1]
+    assert not agent.tools.problems
+
+
+async def test_finish_gate_sends_remaining_errors_back(project):
+    replies = [
+        {"tool_calls": [{"name": "write_file", "arguments": {
+            "path": "bad.py", "content": "def f(x):\n    return x +\n"}}]},
+        {"content": "All done!"},                      # model tries to finish with a bug
+        {"tool_calls": [{"name": "edit_file", "arguments": {
+            "path": "bad.py", "old_string": "return x +", "new_string": "return x"}}]},
+        {"content": "Fixed the syntax error."},
+    ]
+    with FakeOllama(replies) as fake:
+        ui = RecUI()
+        agent = make(project, fake, ui, mode="yolo")
+        answer = await agent.run("write f")
+        gate_msg = fake.requests[2]["messages"][-1]["content"]
+    assert answer == "Fixed the syntax error."
+    assert gate_msg.startswith("[automatic check]") and "bad.py" in gate_msg
+    assert any(e[0] == "notice" and "all changed files pass" in e[1] for e in ui.events)
+
+
+async def test_finish_gate_gives_up_after_rounds(project):
+    bad = {"tool_calls": [{"name": "write_file", "arguments": {
+        "path": "bad.py", "content": "def f(:\n  pass\n"}}]}
+    replies = [bad] + [{"content": "done"}] * 5
+    with FakeOllama(replies) as fake:
+        agent = make(project, fake, mode="yolo", check_rounds=2)
+        assert await agent.run("x") == "done"
+        assert len(fake.requests) == 4     # write + 3 finish attempts (2 gated)
+
+
+def test_check_tool(project):
+    from tinycode.tools import Tools
+    t = Tools(project, Config())
+    (project / "x.json").write_text('{"a": 1,}')
+    r = t.t_check("x.json")
+    assert not r.ok and "invalid JSON" in r.output
+    r = t.t_check("calc.py")
+    assert r.ok and "no problems" in r.output

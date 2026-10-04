@@ -24,6 +24,7 @@ from typing import Any, Callable, Optional
 
 from . import __version__
 from .config import Config
+from . import checks
 from .edits import EditError, apply_edit, diff_stats, unified_diff
 
 IGNORED_DIRS = {
@@ -160,6 +161,11 @@ TOOL_SCHEMAS: list[dict] = [
     _schema("fetch_url",
             "Fetch a web page or API URL and return its text.",
             {"url": {"type": "string"}}, ["url"]),
+    _schema("check",
+            "Check code for syntax errors and obvious bugs (undefined names, unclosed "
+            "tags/braces, invalid JSON…). Give a file or folder, or nothing to check every "
+            "file changed so far. Files are also checked automatically after each change.",
+            {"path": {"type": "string", "description": "file or folder (optional)"}}, []),
 ]
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_SCHEMAS]
 
@@ -178,6 +184,7 @@ class Tools:
         # undo support: path -> original bytes (None = file did not exist)
         self.checkpoint: dict[str, Optional[bytes]] = {}
         self.changed: dict[str, list[int]] = {}   # path -> [added, removed]
+        self.problems: dict[str, "checks.CheckResult"] = {}  # rel path -> latest failed check
         self.cancel = threading.Event()
         self.on_output: Callable[[str], None] | None = None  # live bash output
         self._rg = shutil.which("rg")
@@ -345,8 +352,9 @@ class Tools:
         n = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
         verb = "appended to" if (append and existed) else ("overwrote" if existed else "created")
         add, rem = diff_stats(diff)
-        return ToolResult(f"{verb} {self.rel(p)} (now {n} lines)",
-                          summary=f"{verb} · {n} lines (+{add} -{rem})", diff=diff)
+        return self._with_check(p, content, ToolResult(
+            f"{verb} {self.rel(p)} (now {n} lines)",
+            summary=f"{verb} · {n} lines (+{add} -{rem})", diff=diff))
 
     def t_edit_file(self, path: str, old_string: str = "", new_string: str = "",
                     replace_all: bool = False) -> ToolResult:
@@ -367,9 +375,79 @@ class Tools:
         self._track(p, diff)
         add, rem = diff_stats(diff)
         note = "" if strategy == "exact" else f" (matched via {strategy})"
-        return ToolResult(f"edited {self.rel(p)}: {n} replacement(s){note}. "
-                          f"+{add} -{rem} lines.",
-                          summary=f"+{add} -{rem}{note}", diff=diff)
+        return self._with_check(p, after, ToolResult(
+            f"edited {self.rel(p)}: {n} replacement(s){note}. +{add} -{rem} lines.",
+            summary=f"+{add} -{rem}{note}", diff=diff))
+
+    # ------------------------------------------------------------- checks
+    def _with_check(self, p: Path, text: str, result: ToolResult) -> ToolResult:
+        """Run the fast syntax/error check on a file the model just changed and
+        put the findings in the tool result, so it can fix them right away."""
+        if not self.cfg.auto_check or not checks.supported(p):
+            return result
+        res = checks.check_file(p, text)
+        self._note_check(p, res)
+        if not res.checked:
+            return result
+        result.output += checks.for_model(res, text, self.rel(p))
+        label = checks.summary(res)
+        if label:
+            result.summary = f"{result.summary} · {label}" if result.summary else label
+        result.meta["check"] = res
+        return result
+
+    def _note_check(self, p: Path, res: "checks.CheckResult") -> None:
+        key = self.rel(p)
+        if res.checked and (res.errors or res.incomplete):
+            self.problems[key] = res
+        else:
+            self.problems.pop(key, None)
+
+    def check_paths(self, paths: list[Path]) -> list["checks.CheckResult"]:
+        out = []
+        for p in paths:
+            if p.is_file() and checks.supported(p):
+                res = checks.check_file(p)
+                self._note_check(p, res)
+                out.append(res)
+        return out
+
+    def t_check(self, path: str = "") -> ToolResult:
+        """Check one file, a directory, or (no path) every file changed this session."""
+        if path:
+            base = self.resolve(path)
+            if not base.exists():
+                return ToolResult(f"ERROR: no such path: {self.rel(base)}", ok=False,
+                                  summary="no such path")
+            if base.is_file():
+                targets = [base]
+            else:
+                targets = [Path(r) / f for r, _d, fs in self._walk(base) for f in fs
+                           if checks.supported(Path(f))][:300]
+        else:
+            targets = [self.resolve(k) for k in self.changed] or \
+                [Path(r) / f for r, _d, fs in self._walk(self.workdir) for f in fs
+                 if checks.supported(Path(f))][:300]
+        results = [r for r in self.check_paths(targets) if r.checked]
+        if not results:
+            return ToolResult("nothing to check (no supported files found, or the checkers "
+                              "for these file types are not installed)", summary="nothing to check")
+        bad = [r for r in results if r.errors or r.incomplete]
+        lines = []
+        for r in bad:
+            p = Path(r.path)
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            lines.append(checks.for_model(r, text, self.rel(p), final=True).strip())
+        if not bad:
+            return ToolResult(f"✓ {len(results)} file(s) checked, no problems found.",
+                              summary=f"✓ {len(results)} file(s) clean")
+        n = sum(len(r.errors) + (1 if r.incomplete else 0) for r in bad)
+        return ToolResult("\n\n".join(lines), ok=False,
+                          summary=f"✗ {n} problem(s) in {len(bad)} file(s)",
+                          detail="\n\n".join(lines))
 
     def _walk(self, base: Path):
         for root, dirs, files in os.walk(base):

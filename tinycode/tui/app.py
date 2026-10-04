@@ -387,6 +387,7 @@ class TinyCodeApp(App):
                 yield Static(id="side-context", classes="side-panel")
                 yield Static(id="side-plan", classes="side-panel")
                 yield Static(id="side-files", classes="side-panel")
+                yield Static(id="side-problems", classes="side-panel")
 
     async def on_mount(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -602,6 +603,24 @@ class TinyCodeApp(App):
             f.append(f"+{add}", style=T.GREEN)
             f.append(f" -{rem}\n", style=T.RED)
         self.query_one("#side-files", Static).update(f)
+        # problems found by the automatic checks
+        pr = Text()
+        probs = a.tools.problems
+        pr.append("PROBLEMS\n", style=f"bold {T.BLUE}")
+        if not probs:
+            pr.append("✓ none" if a.tools.changed else "none yet",
+                      style=T.GREEN if a.tools.changed else T.DIM)
+        for path, res in list(probs.items())[-8:]:
+            n = len(res.errors)
+            pr.append(short(path, 22).ljust(23), style=T.TEXT_SOFT)
+            if n:
+                pr.append(f"✗ {n}\n", style=T.RED)
+                for p in res.errors[:2]:
+                    pr.append(f"  {p.line}: {short(p.message, 30)}\n", style=T.MUTED)
+            else:
+                pr.append("… unfinished\n", style=T.YELLOW)
+        pr.rstrip()
+        self.query_one("#side-problems", Static).update(pr)
 
     def _ollama_state(self) -> str:
         if self.no_boot:

@@ -20,18 +20,19 @@ SYSTEM_PROMPT = """You are tinycode, an expert software engineer working as a co
 # Environment
 - Project root: {cwd}
 - OS: {os} · Date: {date} · Git: {git}
-- Top level: {listing}
+- Top level: {listing}{project}
 
 # How to work
 0. Plan: for any task that creates or changes files, your FIRST call is todowrite with the steps, e.g. [{{"content": "Write the HTML and CSS", "status": "in_progress"}}, {{"content": "Add the game logic", "status": "pending"}}]. Update the statuses with todowrite as you finish each step.
 1. Understand: locate code with glob / grep / list_dir and read it with read_file. Never guess what a file contains.
 2. Change: edit_file for targeted edits, write_file for new files or full rewrites.
-3. Verify: run the code, tests or build with bash when it makes sense. If it fails, read the error and fix it.
+3. Verify: every file you write or edit is checked automatically (syntax errors, undefined names, unclosed tags/braces); the result is at the end of the tool output. If it reports a problem, fix it right away with edit_file before doing anything else. Run tests or the program with bash when it makes sense.
 4. Finish: as soon as the work is complete, reply with a short summary and NO tool call. That ends your turn. Don't re-read files you just wrote — you already know their content. Static files (HTML/CSS) need no verification run.
 
 # Rules
 - Before each tool call, say in one short sentence what you are about to do.
 - Write files in small chunks of about 80 lines: write_file with the first chunk, then write_file with append=true for each next chunk, until the file is complete.
+- Write complete, working code. No placeholders such as "// TODO", "..." or "rest of the code here".
 - Act with tools instead of describing what you would do. Don't ask for permission; the user approves risky actions themselves.
 - edit_file: copy old_string exactly from the file WITHOUT the line-number prefix, with 2-3 lines of context so it is unique.
 - Paths are relative to the project root.
@@ -72,6 +73,68 @@ def _listing(cwd: Path, limit: int = 40) -> str:
         return "(empty directory)"
     more = f" … +{len(names) - limit} more" if len(names) > limit else ""
     return ", ".join(names[:limit]) + more
+
+
+def detect_project(cwd: Path) -> str:
+    """One line describing the project type and how to test it."""
+    def has(*names: str) -> bool:
+        return any((cwd / n).exists() for n in names)
+    kinds, test = [], ""
+    if has("package.json"):
+        kinds.append("Node.js")
+        try:
+            pkg = json.loads((cwd / "package.json").read_text(encoding="utf-8"))
+            scripts = pkg.get("scripts") or {}
+            if "test" in scripts and "no test specified" not in str(scripts["test"]):
+                runner = "pnpm" if has("pnpm-lock.yaml") else "yarn" if has("yarn.lock") \
+                    else "bun" if has("bun.lockb", "bun.lock") else "npm"
+                test = f"{runner} test"
+            deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+            for fw in ("react", "next", "vue", "svelte", "express", "vite"):
+                if fw in deps:
+                    kinds.append(fw)
+            if "typescript" in deps or has("tsconfig.json"):
+                kinds.append("TypeScript")
+        except (OSError, ValueError, AttributeError):
+            pass
+    if has("pyproject.toml", "setup.py", "requirements.txt", "setup.cfg"):
+        kinds.append("Python")
+        if has("pytest.ini", "tests", "test", "conftest.py") or \
+                "pytest" in _read(cwd / "pyproject.toml"):
+            test = test or "python -m pytest -q"
+    if has("Cargo.toml"):
+        kinds.append("Rust")
+        test = test or "cargo test"
+    if has("go.mod"):
+        kinds.append("Go")
+        test = test or "go test ./..."
+    if has("pom.xml"):
+        kinds.append("Java (Maven)")
+        test = test or "mvn -q test"
+    if has("build.gradle", "build.gradle.kts"):
+        kinds.append("Java/Kotlin (Gradle)")
+        test = test or "./gradlew test"
+    if has("Gemfile"):
+        kinds.append("Ruby")
+    if has("composer.json"):
+        kinds.append("PHP")
+    if has("CMakeLists.txt"):
+        kinds.append("C/C++ (CMake)")
+    if has("Makefile") and "test:" in _read(cwd / "Makefile"):
+        test = test or "make test"
+    if not kinds:
+        return ""
+    line = "\n- Project: " + ", ".join(dict.fromkeys(kinds))
+    if test:
+        line += f" · run tests with: {test}"
+    return line
+
+
+def _read(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")[:20000]
+    except OSError:
+        return ""
 
 
 def load_memory(cwd: Path, max_chars: int = 6000) -> tuple[str, list[str]]:
@@ -137,7 +200,8 @@ def build_system_prompt(cwd: Path, tool_mode: str = "stream") -> tuple[str, list
     osname = f"{platform.system()} {platform.release()}".strip()
     prompt = SYSTEM_PROMPT.format(
         cwd=str(cwd), os=osname, date=time.strftime("%Y-%m-%d"),
-        git=_git_info(cwd), listing=_listing(cwd), memory="")
+        git=_git_info(cwd), listing=_listing(cwd), project=detect_project(cwd),
+        memory="")
     if tool_mode == "stream":
         prompt += tools_prompt()
     return prompt + mem, used

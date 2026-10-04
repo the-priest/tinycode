@@ -12,6 +12,7 @@ A fully local terminal coding agent (Python + Textual, talks to Ollama).
 - `tinycode/agent.py` — the agent loop (UI-agnostic, `AgentUI` callbacks)
 - `tinycode/tools.py` — tool implementations, schemas, permission rules
 - `tinycode/edits.py` — forgiving `edit_file` matcher + diffs
+- `tinycode/checks.py` — per-language syntax/error checkers run after every edit and before finishing
 - `tinycode/parsing.py` — tool-call normalization, text tool-call recovery, loop detection
 - `tinycode/context.py` — system prompt, project memory, context pruning, @mentions
 - `tinycode/ollama.py` — Ollama HTTP client and server/model lifecycle

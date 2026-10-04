@@ -145,6 +145,7 @@ class Agent:
         recent: dict[str, int] = {}
         retries = 0
         last_abort = ""
+        gate_rounds = 0
         step = 0
         try:
             while step < self.cfg.max_steps:
@@ -259,6 +260,23 @@ class Agent:
                         continue
                     text = "(no answer)"
                 self.messages.append({"role": "assistant", "content": text})
+                # finish gate: don't let the turn end with broken code
+                if self.cfg.auto_check and gate_rounds < self.cfg.check_rounds \
+                        and not self._cancel:
+                    report, nbad = await asyncio.to_thread(self._final_check)
+                    if report:
+                        gate_rounds += 1
+                        await self.ui.notice(
+                            f"✗ automatic check: {nbad} file(s) still have problems — "
+                            "sending them back to the model to fix", "warn")
+                        self.messages.append({"role": "user", "content":
+                            "[automatic check] You are not done yet. These files you changed "
+                            "still have errors:\n\n" + report +
+                            "\n\nFix every problem with edit_file (or write_file for an "
+                            "unfinished file), then give your final summary."})
+                        continue
+                    if gate_rounds:
+                        await self.ui.notice("✓ automatic check: all changed files pass", "ok")
                 final_text = text
                 break
             else:
@@ -514,6 +532,23 @@ class Agent:
             result.output += (f"\n\nNOTE: you have made this exact {name} call "
                               f"{recent[sig]} times. Do something different, or finish.")
         await self._finish_call(call_id, name, args, result, t0)
+
+    def _final_check(self) -> tuple[str, int]:
+        """Re-check every file changed this turn. Returns (report, files_with_problems)."""
+        from . import checks
+        paths = [Path(p) for p in self.tools.checkpoint]
+        results = self.tools.check_paths(paths)
+        parts = []
+        for r in results:
+            if not r.checked or not (r.errors or r.incomplete):
+                continue
+            p = Path(r.path)
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            parts.append(checks.for_model(r, text, self.tools.rel(p), final=True).strip())
+        return "\n\n".join(parts), len(parts)
 
     async def _log_step(self, name: str, args: dict) -> None:
         """When the model doesn't keep a plan, show what it's doing as one."""

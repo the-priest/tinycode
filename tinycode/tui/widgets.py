@@ -458,6 +458,21 @@ class ToolCallView(Vertical):
                 body = Text(text[:30000], style=style if not r.ok else T.TEXT_SOFT)
             else:
                 body = Text(short_block(text, 6), style=style)
+        chk = r.meta.get("check")
+        if chk is not None and (chk.errors or chk.incomplete):
+            note = Text()
+            for p in chk.errors[:8]:
+                note.append("  ✗ ", style=T.RED)
+                note.append(f"line {p.line}: ", style=f"bold {T.RED}")
+                note.append(p.message[:160] + (f"  [{p.where}]" if p.where else "") + "\n",
+                            style=T.RED)
+            if len(chk.errors) > 8:
+                note.append(f"  … {len(chk.errors) - 8} more\n", style=T.RED)
+            if chk.incomplete and not chk.errors:
+                note.append("  … unfinished so far: " + "; ".join(chk.incomplete)[:160] + "\n",
+                            style=T.YELLOW)
+            note.rstrip()
+            body = note if body is None else Group(body, note)
         if body is None:
             self.body.display = False
         else:

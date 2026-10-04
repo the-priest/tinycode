@@ -35,6 +35,8 @@ NAME_ALIASES = {
     "update_todos": "todowrite", "plan": "todowrite", "write_todos": "todowrite",
     "fetch": "fetch_url", "web_fetch": "fetch_url", "http_get": "fetch_url",
     "curl": "fetch_url", "webfetch": "fetch_url",
+    "lint": "check", "check_syntax": "check", "syntax_check": "check", "diagnostics": "check",
+    "validate": "check", "check_file": "check", "verify": "check", "check_code": "check",
 }
 
 ARG_ALIASES = {
