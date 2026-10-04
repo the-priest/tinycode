@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tinycode"
 dynamic = ["version"]
-description = "A fast, reliable, fully local coding agent for the terminal (Ollama + Ling-3.0-tiny)."
+description = "A fast, reliable, fully local coding agent for the terminal (Ollama + LFM2.5-8B-A1B)."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"

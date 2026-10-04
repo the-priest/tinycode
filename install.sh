@@ -11,7 +11,7 @@
 #    • tinycode in its own virtualenv    ~/.local/share/tinycode/venv
 #    • the `tinycode` command            ~/.local/bin/tinycode
 #    • Ollama                            (if missing)
-#    • the Ling-3.0-tiny model           (~5.3 GB, one-time download)
+#    • the LFM2.5-8B-A1B model          (~5 GB, one-time download)
 #    • ripgrep (fast search), a desktop launcher, a default config
 #
 #  Options:
@@ -27,7 +27,7 @@ set -euo pipefail
 
 REPO="the-priest/tinycode"
 REF="${TINYCODE_REF:-main}"
-MODEL="${TINYCODE_MODEL:-hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL}"
+MODEL="${TINYCODE_MODEL:-hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M}"
 PREFIX="${TINYCODE_HOME:-$HOME/.local/share/tinycode}"
 VENV="$PREFIX/venv"
 BIN_DIR="$HOME/.local/bin"
@@ -214,7 +214,7 @@ esac
 # default config
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
   "$VENV/bin/tinycode" config >/dev/null
-  if [ "$MODEL" != "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL" ]; then
+  if [ "$MODEL" != "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M" ]; then
     sed -i.bak "s|^#\{0,1\} \{0,1\}model = .*|model = \"$MODEL\"|; s|^#\{0,1\} \{0,1\}model_label = .*|model_label = \"${MODEL##*/}\"|" "$CONFIG_DIR/config.toml" && rm -f "$CONFIG_DIR/config.toml.bak"
   fi
   ok "config → $CONFIG_DIR/config.toml"

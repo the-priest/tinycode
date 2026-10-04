@@ -8,7 +8,7 @@
 **A fast, reliable, fully local coding agent for your terminal.**
 
 Talk to it in plain language. It reads your code, edits files, runs commands and tests, and **proves its work runs** before it says it's done.
-It runs on your machine through [Ollama](https://ollama.com) with **Ling-3.0-tiny**, and nothing leaves your computer.
+It runs on your machine through [Ollama](https://ollama.com) with **LFM2.5-8B-A1B**, and nothing leaves your computer.
 
 </div>
 
@@ -27,7 +27,7 @@ The installer does everything and asks before anything that needs `sudo`:
 | ✓ Python 3.9+ and venv | installed if missing (apt / dnf / pacman / zypper / apk / brew) |
 | ✓ tinycode | in its own virtualenv, with a `tinycode` command in `~/.local/bin` |
 | ✓ Ollama | official installer if missing. It also offers to switch Ollama from always-on to on-demand. |
-| ✓ the model | Ling-3.0-tiny, about 5.3 GB, downloaded once with a progress bar |
+| ✓ the model | LFM2.5-8B-A1B, about 5 GB, downloaded once with a progress bar |
 | ✓ extras | Node.js to run and test the web apps it builds, ripgrep for fast search, an app-menu launcher, a default config, and a `doctor` self-check |
 
 Options: `-y` (no questions), `--no-model`, `--no-ollama`, `--model TAG`, `--uninstall [--purge]`.
@@ -139,7 +139,7 @@ A file that is still being written in chunks is reported as "unfinished, keep go
 
 ```toml
 [model]
-model = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
+model = "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M"
 num_ctx = 32768        # lower if you're short on RAM
 num_predict = 16384
 temperature = 0.6
@@ -165,7 +165,7 @@ Any Ollama model with tool support works: `tinycode --model qwen3:8b`.
 
 ## The model
 
-**Ling-3.0-tiny** by InclusionAI (MIT licence) is a sparse mixture-of-experts model with about 7.9B total and 1.3B active parameters, quantized to Q4_K_XL (about 5.3 GB). It supports tool calling and reasoning in Ollama. It runs on a CPU, faster with a GPU, and needs 8 GB of RAM or more.
+**LFM2.5-8B-A1B** by Liquid AI (LFM Open License v1.0) is a hybrid mixture-of-experts model with about 8B total and 1B active parameters, in the Q4_K_M quantization (about 5 GB). It is built for on-device agents, chaining tool calls and following complex instructions, and supports tool calling in Ollama through llama.cpp. It runs on a CPU, faster with a GPU, and needs 8 GB of RAM or more.
 
 ## Troubleshooting
 

@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MODEL = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
+DEFAULT_MODEL = "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M"
 
 
 def _xdg(var: str, fallback: str) -> Path:
@@ -71,7 +71,7 @@ def log(msg: str) -> None:
 class Config:
     # model + server
     model: str = DEFAULT_MODEL
-    model_label: str = "Ling-3.0-tiny"
+    model_label: str = "LFM2.5-8B-A1B"
     host: str = "127.0.0.1:11434"
     # sampling / budget
     num_ctx: int = 32768
@@ -197,8 +197,8 @@ DEFAULT_CONFIG_TOML = """# tinycode configuration
 # Uncomment a line and change it to override that setting.
 
 [model]
-# model = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
-# model_label = "Ling-3.0-tiny"
+# model = "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M"
+# model_label = "LFM2.5-8B-A1B"
 # host = "127.0.0.1:11434"
 # num_ctx = 32768        # context window (tokens). Lower it if you run out of RAM.
 # num_predict = 16384    # max tokens per model step
@@ -230,8 +230,8 @@ _V200_TEMPLATE = """# tinycode configuration
 # Every key is optional; delete what you don't need.
 
 [model]
-model = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
-model_label = "Ling-3.0-tiny"
+model = "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M"
+model_label = "LFM2.5-8B-A1B"
 host = "127.0.0.1:11434"
 num_ctx = 16384        # context window (tokens). Lower it if you run out of RAM.
 num_predict = 4096     # max tokens per model step
