@@ -530,6 +530,14 @@ class Agent:
             await self._finish_call(call_id, name, args, result, t0)
             return
 
+        outside = self.tools.blocked(name, args)
+        if outside:
+            result = ToolResult(
+                f"ERROR: {outside}. tinycode is sandboxed to {self.workdir}; "
+                "work only inside it.", ok=False, summary="outside the project")
+            await self._finish_call(call_id, name, args, result, t0)
+            return
+
         sig = name + json.dumps(args, sort_keys=True, default=str)
         recent[sig] = recent.get(sig, 0) + 1
 

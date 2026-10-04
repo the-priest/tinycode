@@ -162,6 +162,78 @@ def danger_reason(cmd: str) -> str:
     return ""
 
 
+# device files that are always fine to touch from inside the sandbox
+_DEV_OK = {"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
+           "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty"}
+
+
+def _token_outside(token: str, root: Path) -> bool:
+    """True if a single shell word points at a path outside `root`."""
+    t = token
+    if not t or t in _DEV_OK or t.startswith("/dev/fd/"):
+        return False
+    if t.startswith("--") and "=" in t:
+        t = t.split("=", 1)[1]
+    elif t.startswith("-"):
+        return False                     # an option, not a path argument
+    if not (t in (".", "..") or "/" in t or t.startswith("~")):
+        return False
+    t = t.replace("${HOME}", str(Path.home())).replace("$HOME", str(Path.home()))
+    t = os.path.expanduser(t)
+    p = Path(t)
+    if not p.is_absolute():
+        p = root / p
+    try:
+        p = p.resolve()
+    except OSError:
+        p = Path(os.path.abspath(str(p)))
+    try:
+        p.relative_to(root)
+        return False
+    except ValueError:
+        return True
+
+
+def escape_reason(cmd: str, workdir: Path) -> str:
+    """Why a shell command reaches outside the project directory, or ''.
+
+    This is best-effort: it inspects the command words and scans quoted
+    strings for absolute paths. It cannot sandbox arbitrary code (e.g. a
+    script that builds a path at runtime), but it stops the model from
+    plainly reading or writing outside the project (../, ~, /etc, ...)."""
+    try:
+        root = Path(workdir).resolve()
+    except OSError:
+        root = Path(workdir)
+    segs = _segments(cmd)
+    if segs:
+        words = [w for seg in segs for w in seg]
+    else:
+        try:
+            words = shlex.split(cmd, posix=True)
+        except ValueError:
+            return "the command could not be parsed, so it stays inside the project"
+    for w in words:
+        if _token_outside(w, root):
+            return f"it reaches outside the project directory ({w})"
+    # catch paths hidden inside quotes, e.g. python -c "open('/etc/passwd')"
+    for m in re.finditer(r"(?<![\w:/.-])(/(?![/\s])[^\s'\"`)]+)", cmd):
+        tok = m.group(1)
+        if _token_outside(tok, root):
+            return f"it reaches outside the project directory ({tok})"
+    # relative escapes hidden in quoted code: open('../secret'), sh -c "cd ../.."
+    for m in re.finditer(r"\.\.(?:/[^\s'\"`)]*)+", cmd):
+        tok = m.group(0)
+        if _token_outside(tok, root):
+            return f"it reaches outside the project directory ({tok})"
+    # home-relative paths hidden in quoted code: open('~/secret')
+    for m in re.finditer(r"(?<![\w~])~/[^\s'\"`)]*", cmd):
+        tok = m.group(0)
+        if _token_outside(tok, root):
+            return f"it reaches outside the project directory ({tok})"
+    return ""
+
+
 @dataclass
 class ToolResult:
     output: str                     # sent to the model
@@ -321,6 +393,31 @@ class Tools:
         except (ValueError, OSError):
             return False
 
+    # ------------------------------------------------------------ sandbox
+    def blocked(self, name: str, args: dict) -> str:
+        """If the sandbox forbids this call, return a short reason. '' = allowed."""
+        if not self.cfg.sandbox:
+            return ""
+        if name in SHELL_TOOLS:
+            return escape_reason(str(args.get("command", "")), self.workdir)
+        if name in EDIT_TOOLS or name in ("read_file", "list_dir", "glob", "grep",
+                                          "check", "test_app"):
+            p = self.resolve(args.get("path"))
+            if not self.inside(p):
+                return (f"{name} is limited to the project directory; "
+                        f"{self.rel(p)} is outside it")
+        return ""
+
+    def _confine(self, p: Path) -> Optional["ToolResult"]:
+        """Return an error result when `p` escapes the project (sandbox on)."""
+        if self.cfg.sandbox and not self.inside(p):
+            return ToolResult(
+                f"ERROR: {self.rel(p)} is outside the project directory "
+                f"({self.workdir}). tinycode only works inside the directory it "
+                "was started in.",
+                ok=False, summary="outside the project")
+        return None
+
     def _limit(self) -> int:
         # never let one tool result eat more than ~40% of the context window
         return max(2000, min(self.cfg.max_tool_chars, int(self.cfg.num_ctx * 3.5 * 0.4)))
@@ -359,6 +456,9 @@ class Tools:
         would fail anyway, so there is no need to ask the user."""
         try:
             p = self.resolve(args.get("path"))
+            blocked = self._confine(p)
+            if blocked:
+                return "", blocked.output
             if name == "write_file":
                 before = p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
                 after = str(args.get("content", ""))
@@ -399,6 +499,9 @@ class Tools:
     # --------------------------------------------------------------- tools
     def t_read_file(self, path: str, offset: int = 1, limit: int = 400) -> ToolResult:
         p = self.resolve(path)
+        blocked = self._confine(p)
+        if blocked:
+            return blocked
         if not p.exists():
             hint = self._similar_paths(p.name)
             return ToolResult(f"ERROR: file not found: {self.rel(p)}{hint}", ok=False,
@@ -442,6 +545,9 @@ class Tools:
 
     def t_write_file(self, path: str, content: str = "", append: bool = False) -> ToolResult:
         p = self.resolve(path)
+        blocked = self._confine(p)
+        if blocked:
+            return blocked
         if p.is_dir():
             return ToolResult(f"ERROR: {self.rel(p)} is a directory.", ok=False,
                               summary="is a directory")
@@ -469,6 +575,9 @@ class Tools:
     def t_edit_file(self, path: str, old_string: str = "", new_string: str = "",
                     replace_all: bool = False) -> ToolResult:
         p = self.resolve(path)
+        blocked = self._confine(p)
+        if blocked:
+            return blocked
         if not p.is_file():
             hint = self._similar_paths(p.name)
             return ToolResult(f"ERROR: file not found: {self.rel(p)}{hint}", ok=False,
@@ -647,6 +756,9 @@ class Tools:
             steps = [steps] if isinstance(steps, dict) else None
         if path:
             p = self.resolve(path)
+            blocked = self._confine(p)
+            if blocked:
+                return blocked
             if p.is_dir():
                 p = p / "index.html"
             if not p.is_file():
@@ -712,6 +824,9 @@ class Tools:
         """Check one file, a directory, or (no path) every file changed this session."""
         if path:
             base = self.resolve(path)
+            blocked = self._confine(base)
+            if blocked:
+                return blocked
             if not base.exists():
                 return ToolResult(f"ERROR: no such path: {self.rel(base)}", ok=False,
                                   summary="no such path")
@@ -767,6 +882,9 @@ class Tools:
 
     def t_list_dir(self, path: str = ".", depth: int = 2) -> ToolResult:
         p = self.resolve(path)
+        blocked = self._confine(p)
+        if blocked:
+            return blocked
         if not p.is_dir():
             return ToolResult(f"ERROR: not a directory: {self.rel(p)}", ok=False,
                               summary="not a directory")
@@ -805,6 +923,9 @@ class Tools:
 
     def t_glob(self, pattern: str, path: str = ".") -> ToolResult:
         base = self.resolve(path)
+        blocked = self._confine(base)
+        if blocked:
+            return blocked
         pattern = str(pattern).strip()
         if not base.is_dir():
             return ToolResult(f"ERROR: not a directory: {self.rel(base)}", ok=False,
@@ -841,6 +962,9 @@ class Tools:
     def t_grep(self, pattern: str, path: str = ".", include: str | None = None,
                ignore_case: bool = False) -> ToolResult:
         base = self.resolve(path)
+        blocked = self._confine(base)
+        if blocked:
+            return blocked
         if not base.exists():
             return ToolResult(f"ERROR: no such path: {self.rel(base)}", ok=False,
                               summary="no such path")
@@ -895,10 +1019,17 @@ class Tools:
         return ToolResult(_truncate(out, self._limit()),
                           summary=f"{total} match(es) in {nfiles} file(s)", detail=out)
 
-    def t_bash(self, command: str, timeout: int = 0) -> ToolResult:
+    def t_bash(self, command: str, timeout: int = 0, sandbox: bool = True) -> ToolResult:
         command = str(command).strip()
         if not command:
             return ToolResult("ERROR: empty command", ok=False, summary="empty command")
+        if sandbox and self.cfg.sandbox:
+            why = escape_reason(command, self.workdir)
+            if why:
+                return ToolResult(
+                    f"ERROR: refused — {why}. tinycode is confined to "
+                    f"{self.workdir}. Use paths inside the project.",
+                    ok=False, summary="outside the project")
         timeout = int(timeout or self.cfg.bash_timeout)
         timeout = max(1, min(timeout, 1800))
         env = dict(os.environ)

@@ -10,7 +10,7 @@ A fully local terminal coding agent (Python + Textual, talks to Ollama).
 
 ## Layout
 - `tinycode/agent.py` — the agent loop (UI-agnostic, `AgentUI` callbacks)
-- `tinycode/tools.py` — tool implementations, schemas, permission rules
+- `tinycode/tools.py` — tool implementations, schemas, permission rules, and the project sandbox (every path is confined to the workdir; `escape_reason` blocks shell escapes)
 - `tinycode/edits.py` — forgiving `edit_file` matcher + diffs
 - `tinycode/checks.py` — per-language syntax/error checkers run after every edit and before finishing
 - `tinycode/webcheck.py` + `tinycode/assets/domsim.js` — runs web pages in a simulated browser (Node vm + fake DOM): clicks, keys, probes, model-written scenarios

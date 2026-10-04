@@ -38,6 +38,9 @@ SYSTEM_PROMPT = """You are tinycode, an expert software engineer working as a co
 - Act with tools instead of describing what you would do. Don't ask for permission; the user approves risky actions themselves.
 - edit_file: copy old_string exactly from the file WITHOUT the line-number prefix, with 2-3 lines of context so it is unique.
 - Paths are relative to the project root.
+- You are sandboxed to the project root: never read, write, list or run anything
+  outside it (no ../, ~, /etc, /tmp, $HOME). If a task truly needs that, stop and
+  ask the user to do it instead.
 - If a tool returns ERROR, read the message and correct your next call. Don't repeat a failing call unchanged.
 - Never invent file contents, command output or results.
 - Simple questions that need no files: answer directly, no tools.
@@ -334,17 +337,28 @@ def transcript_for_summary(messages: list[dict], max_chars: int = 30000) -> str:
     return text[-max_chars:]
 
 
-def expand_mentions(text: str, cwd: Path, max_chars: int = 20000) -> tuple[str, list[str]]:
+def expand_mentions(text: str, cwd: Path, max_chars: int = 20000,
+                    sandbox: bool = True) -> tuple[str, list[str]]:
     """Inline @file references: '@src/app.py' attaches that file's contents."""
     import re
     attached: list[str] = []
     blocks: list[str] = []
     total = 0
+
+    def inside(p: Path) -> bool:
+        if not sandbox:
+            return True
+        try:
+            p.resolve().relative_to(cwd.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
     for m in re.finditer(r"(?<![\w/])@([\w./\-~]+[\w/])", text):
         raw = m.group(1)
         p = Path(os.path.expanduser(raw))
         p = p if p.is_absolute() else cwd / p
-        if p.is_file():
+        if p.is_file() and inside(p):
             try:
                 content = p.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -356,7 +370,7 @@ def expand_mentions(text: str, cwd: Path, max_chars: int = 20000) -> tuple[str, 
                                  enumerate(content.splitlines(), 1))
             blocks.append(f'<file path="{raw}">\n{numbered}\n</file>')
             attached.append(raw)
-        elif p.is_dir():
+        elif p.is_dir() and inside(p):
             try:
                 names = sorted(x.name + ("/" if x.is_dir() else "") for x in p.iterdir())[:100]
             except OSError:

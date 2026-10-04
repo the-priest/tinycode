@@ -31,6 +31,8 @@ def test_flags():
     a = parse_args(["--yolo", "--ctx", "8192", "proj"])
     cfg = build_config(a)
     assert cfg.mode == "yolo" and cfg.num_ctx == 8192 and a.directory == "proj"
+    assert cfg.sandbox is True                       # confined by default
+    assert build_config(parse_args(["--no-sandbox"])).sandbox is False
 
 
 def test_config_subcommand(capsys):

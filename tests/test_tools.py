@@ -72,6 +72,47 @@ def test_permissions(project):
     assert t.classify("edit_file", {"path": "/etc/passwd"}, "yolo")[0] is True
 
 
+def test_sandbox_blocks_outside_paths(project, tmp_path):
+    t = mk(project)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n")
+    assert not t.t_read_file(str(outside)).ok
+    assert not t.t_write_file(str(outside), "x").ok
+    assert not t.t_edit_file(str(outside), "secret", "x").ok
+    assert not t.t_list_dir(str(tmp_path)).ok
+    assert not t.t_grep("secret", str(tmp_path)).ok
+    assert "outside" in t.blocked("read_file", {"path": str(outside)})
+    assert t.t_read_file("calc.py").ok                 # inside still works
+    assert not t.blocked("write_file", {"path": "sub/new.py"})
+    # bash refuses explicit escapes
+    assert not t.t_bash("cat " + str(outside)).ok
+    assert not t.t_bash("cat ../outside.txt").ok
+    assert t.t_bash("python3 calc.py").ok
+    assert "outside the project" in t.t_bash("cat /etc/passwd").output
+
+
+def test_sandbox_can_be_disabled(project, tmp_path):
+    t = Tools(project, Config(sandbox=False))
+    outside = tmp_path / "outside.txt"
+    assert t.t_write_file(str(outside), "x").ok and outside.exists()
+    assert not t.blocked("read_file", {"path": str(outside)})
+
+
+def test_escape_reason(tmp_path):
+    from tinycode.tools import escape_reason
+    proj = tmp_path / "p"
+    proj.mkdir()
+    for ok in ["ls", "python3 calc.py", "rm -rf ./build", "find . -name '*.py'",
+               "2>/dev/null ls", "curl https://example.com/x", "pip install -e .",
+               "grep -r foo .", "node script.js"]:
+        assert escape_reason(ok, proj) == "", ok
+    for bad in ["cat /etc/passwd", "cat ../x", "cd / && ls", "echo x > /tmp/x",
+                'python -c "open(\'/etc/passwd\')"', "ls ~/", "cd /root",
+                'python3 -c "open(\'../secret\').read()"',
+                'sh -c "cd ../.. && ls"', 'python3 -c "open(\'~/secret\')"']:
+        assert escape_reason(bad, proj), bad
+
+
 def test_safe_command():
     assert is_safe_command("cat a | grep b | wc -l")
     assert not is_safe_command("echo x > file")

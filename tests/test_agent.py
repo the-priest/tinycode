@@ -33,6 +33,48 @@ def make(project, fake, ui=None, **cfg):
     return Agent(c, Ollama(c), project, ui or RecUI())
 
 
+async def test_sandboxed_write_never_prompts(project, tmp_path):
+    class UI(RecUI):
+        async def approve(self, name, args, diff, warning):
+            self.events.append(("approve", name))
+            raise AssertionError("sandboxed calls must not prompt")
+
+    outside = tmp_path / "outside.txt"
+    replies = [
+        {"tool_calls": [{"name": "write_file", "arguments": {
+            "path": str(outside), "content": "x"}}]},
+        {"content": "I can only work inside the project."},
+    ]
+    with FakeOllama(replies) as fake:
+        ui = UI()
+        agent = make(project, fake, ui, mode="yolo")
+        answer = await agent.run("write outside")
+    assert answer.startswith("I can only work")
+    assert not outside.exists()
+    assert not any(e[0] == "approve" for e in ui.events)
+    results = [m["content"] for m in agent.messages if is_tool_result(m)]
+    assert any("outside the project" in r or "sandboxed" in r for r in results)
+
+
+async def test_sandboxed_bash_never_prompts(project):
+    class UI(RecUI):
+        async def approve(self, name, args, diff, warning):
+            self.events.append(("approve", name))
+            raise AssertionError("sandboxed calls must not prompt")
+
+    replies = [
+        {"tool_calls": [{"name": "bash", "arguments": {"command": "cat /etc/passwd"}}]},
+        {"content": "blocked"},
+    ]
+    with FakeOllama(replies) as fake:
+        ui = UI()
+        agent = make(project, fake, ui, mode="yolo")
+        assert await agent.run("read the shadow file") == "blocked"
+    assert not any(e[0] == "approve" for e in ui.events)
+    results = [m["content"] for m in agent.messages if is_tool_result(m)]
+    assert any("outside the project" in r for r in results)
+
+
 async def test_fix_bug_end_to_end(project):
     replies = [
         {"thinking": "Read the file first.", "tool_calls": [

@@ -844,7 +844,7 @@ class TinyCodeApp(App):
         self._turn_start = time.monotonic()
         self.query_one("#prompt-box").add_class("-busy")
         await self.emit_user(text)
-        expanded, attached = expand_mentions(text, self.workdir)
+        expanded, attached = expand_mentions(text, self.workdir, sandbox=self.cfg.sandbox)
         if attached:
             await self.bridge.notice("attached " + ", ".join(attached), "dim")
         self.log_view.anchor()
@@ -857,7 +857,7 @@ class TinyCodeApp(App):
             try:
                 self.query_one("#prompt-box").remove_class("-busy")
             except Exception:  # noqa: BLE001 - app may be shutting down
-                return
+                pass
             self.agent.busy = False
             el = time.monotonic() - self._turn_start
             if el > 3 and not self.agent._cancel:
@@ -884,7 +884,7 @@ class TinyCodeApp(App):
         tools.on_output = lambda s: self.call_threadsafe(view.add_live, s)
         tools.cancel.clear()
         try:
-            res = await asyncio.to_thread(tools.t_bash, cmd)
+            res = await asyncio.to_thread(tools.t_bash, cmd, 0, False)
         finally:
             tools.on_output = None
         res.detail = res.detail or res.output

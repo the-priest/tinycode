@@ -96,6 +96,8 @@ class Config:
     bash_timeout: int = 120
     # permissions: "ask" | "auto-edit" | "yolo"
     mode: str = "ask"
+    # hard-confine every tool (reads, writes, shell) to the project directory
+    sandbox: bool = True
     # ollama lifecycle
     manage_server: bool = True       # start `ollama serve` if it is not running
     stop_server_on_exit: bool = True  # stop the server tinycode started/adopted
@@ -213,6 +215,7 @@ DEFAULT_CONFIG_TOML = """# tinycode configuration
 # run_tests = true       # run the project's tests before finishing, when code changed
 # bash_timeout = 120
 # mode = "ask"           # ask | auto-edit | yolo
+# sandbox = true         # never touch anything outside the project directory
 
 [ollama]
 # manage_server = true        # start `ollama serve` automatically

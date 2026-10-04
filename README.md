@@ -55,6 +55,7 @@ Then just ask:
 | `tinycode -c` | continue the last conversation in this directory |
 | `tinycode -p "…"` | headless: run the task, print the answer (scripts, CI, pipes) |
 | `tinycode --yolo` | auto-approve everything (or `--mode auto-edit`) |
+| `tinycode --no-sandbox` | let tools reach outside the project directory (off by default) |
 | `tinycode --no-think` | turn off reasoning for faster replies |
 | `tinycode doctor` | check Python, Ollama, the model, tool support and RAM |
 | `tinycode update` | upgrade in place |
@@ -100,7 +101,8 @@ A file that is still being written in chunks is reported as "unfinished, keep go
 **Safe by default.**
 - Every file edit shows a coloured diff before it is applied. You can answer *Yes*, *Yes, don't ask again*, or *No, and tell it what to do instead*.
 - Read-only commands (`ls`, `cat`, `git status`, `grep`, …) run without asking.
-- Dangerous commands (`rm -rf ~`, `sudo`, `git push --force`, `curl | sh`, …) always ask, even in yolo mode. So do writes outside the project.
+- Dangerous commands (`rm -rf ~`, `sudo`, `git push --force`, `curl | sh`, …) always ask, even in yolo mode.
+- **Sandboxed to the project.** tinycode is started in one directory and every tool — reads, writes, search and shell — is confined to it. Paths outside (`../`, `~`, `/etc`, absolute paths) are refused with a clear error, whether the model asks for them or a shell command reaches for them. Turn this off with `sandbox = false` if you really need it.
 - `/undo` reverts all the file changes from the last turn.
 
 **Nice to use.**
@@ -148,6 +150,7 @@ tool_mode = "native"   # native: Ollama tool calling · stream: experimental liv
 
 [agent]
 mode = "ask"           # ask | auto-edit | yolo
+sandbox = true         # confine every tool to the directory you started in
 max_steps = 40
 auto_check = true     # check every edited file, and again before finishing
 app_check = true      # run changed web pages in a simulated browser before finishing
