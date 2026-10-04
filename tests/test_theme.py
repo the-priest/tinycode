@@ -1,6 +1,7 @@
 """Theme palettes, aliases and persistence."""
 
-from tinycode.config import load_config, save_theme, ui_state_path
+import tinycode.config as conf
+from tinycode.config import load_config, save_setting
 from tinycode.tui import theme as T
 
 
@@ -26,12 +27,12 @@ def test_set_theme_aliases_and_fallback():
     assert T.MODE_STYLE["yolo"][0] == T.RED
 
 
-def test_theme_persists_and_config_roundtrip():
-    save_theme("dracula")
-    assert ui_state_path().read_text().strip() == 'theme = "dracula"'
+def test_theme_persists_via_config():
+    save_setting("theme", "dracula")
+    assert 'theme = "dracula"' in conf.CONFIG_PATH.read_text()
     assert load_config().theme == "dracula"
-    # explicit config / CLI overrides win over the remembered choice
+    # explicit CLI/env overrides win over the saved choice
     assert load_config({"theme": "nord"}).theme == "nord"
-    # a stored value that no longer exists falls back cleanly
-    save_theme("does-not-exist")
+    # a saved value that no longer exists falls back cleanly
+    save_setting("theme", "does-not-exist")
     assert load_config().theme == T.DEFAULT_THEME

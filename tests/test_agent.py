@@ -1,6 +1,5 @@
 import asyncio
 
-import pytest
 
 from fake_ollama import FakeOllama
 from tinycode.agent import Agent, AgentUI, Decision
@@ -137,8 +136,8 @@ async def test_repetition_is_cut_and_retried(project):
         ui = RecUI()
         agent = make(project, fake, ui)
         answer = await agent.run("question")
-        # the retry runs with reasoning off
-        assert fake.requests[1].get("think") is False
+        # the retry keeps reasoning on (Ling reasons inside the answer when it's off)
+        assert fake.requests[1].get("think") is True
     assert answer == "The answer is 42."
     assert any(e[0] == "notice" and "repeating" in e[1] for e in ui.events)
 
@@ -536,3 +535,63 @@ async def test_finish_gate_runs_project_tests_once(tmp_path):
     assert "tests fail" in gate and "assert" in gate
     assert answer == "Fixed the test failure."
     assert any(e[0] == "notice" and "tests pass" in e[1] for e in ui.events), ui.events
+
+
+
+async def test_tool_call_written_inside_thinking_is_recovered(project):
+    replies = [
+        {"thinking": "I should read the file first.\n<tool_call>read_file\n<arg_key>path</arg_key>\n"
+                     "<arg_value>README.md</arg_value>\n</tool_call>"},
+        {"content": "It is a tiny calculator.<|role_end|>"},
+    ]
+    with FakeOllama(replies) as fake:
+        agent = make(project, fake)
+        answer = await agent.run("what is this?")
+    assert answer == "It is a tiny calculator."
+    results = [m["content"] for m in agent.messages if is_tool_result(m)]
+    assert results and "A tiny calculator" in results[0]
+
+
+async def test_considered_but_unmade_calls_in_thinking_are_ignored(project):
+    replies = [
+        {"thinking": "Maybe <tool_call>bash\n<arg_key>command</arg_key>\n<arg_value>rm x</arg_value>\n"
+                     "</tool_call> but no, that's not needed. The answer is simple.",
+         "content": "42"},
+    ]
+    with FakeOllama(replies) as fake:
+        agent = make(project, fake)
+        assert await agent.run("q") == "42"
+    assert not [m for m in agent.messages if is_tool_result(m)]
+
+
+async def test_stalled_mid_thought_gets_a_continue_nudge(project):
+    replies = [{"thinking": "Let me think about the layout and"},
+               {"content": "done"}]
+    with FakeOllama(replies) as fake:
+        ui = RecUI()
+        agent = make(project, fake, ui)
+        assert await agent.run("x") == "done"
+        assert "stopped in the middle of thinking" in fake.requests[1]["messages"][-1]["content"]
+        assert fake.requests[1].get("think") is True
+
+
+async def test_reasoning_is_kept_in_history_and_sampling_options_sent(project):
+    replies = [{"thinking": "plan", "tool_calls": [{"name": "list_dir", "arguments": {}}]},
+               {"content": "ok"}]
+    with FakeOllama(replies) as fake:
+        agent = make(project, fake)
+        await agent.run("x")
+        second = fake.requests[1]
+    asst = [m for m in second["messages"] if m["role"] == "assistant"][0]
+    assert asst.get("thinking") == "plan"
+    assert second["options"]["repeat_penalty"] == 1.0
+
+
+def test_presets_and_explicit_settings():
+    from tinycode.config import load_config
+    cfg = load_config({"model": "qwen9b"})
+    assert cfg.model == "qwen3.5:9b" and cfg.model_label == "Qwen3.5-9B"
+    cfg = load_config({"model": "lfm", "temperature": 0.9})
+    assert cfg.temperature == 0.9 and cfg.extra["min_p"] == 0.15
+    cfg = load_config({"model": "ling"})
+    assert cfg.extra["stop"] == ["<|role_end|>"]

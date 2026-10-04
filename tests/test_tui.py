@@ -67,7 +67,7 @@ async def test_tui_full_turn(project, tmp_path):
 
 
 async def test_theme_switch_is_live(project):
-    from tinycode.config import ui_state_path
+    import tinycode.config as conf
     from tinycode.tui import theme as T
 
     cfg = Config(host="127.0.0.1:9", manage_server=False, theme="nord")
@@ -80,7 +80,7 @@ async def test_theme_switch_is_live(project):
         await pilot.pause(0.2)
         assert T.active() == "catppuccin-mocha"
         assert app.screen.styles.background != nord_bg
-        assert ui_state_path().read_text().strip() == 'theme = "catppuccin-mocha"'
+        assert 'theme = "catppuccin-mocha"' in conf.CONFIG_PATH.read_text()
         # unknown themes are rejected without disturbing the active one
         await app._command("/theme banana")
         await pilot.pause(0.1)
@@ -112,3 +112,63 @@ async def test_message_typed_during_boot_is_sent(project):
             assert app.queue == ["hi"]
             await wait_for(lambda: len(fake.requests) == 1 and not app.agent.busy, pilot)
             assert app.agent.messages[-1]["content"] == "hello there"
+
+
+async def test_palette_toggles_and_switches_model(project):
+    import tinycode.config as conf
+    from tinycode.tui.widgets import Palette
+    with FakeOllama([{"content": "hi"}]) as fake:
+        cfg = Config(model=fake.model, host=fake.host)
+        app = TinyCodeApp(cfg, project)
+        async with app.run_test(size=(140, 45)) as pilot:
+            await wait_for(lambda: app.ready, pilot)
+            # ctrl+p opens settings; a toggle changes in place and is saved
+            await pilot.press("ctrl+p")
+            assert isinstance(app.screen, Palette)
+            assert app.agent.think
+            await pilot.press(*"reasoning", "enter")
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, Palette)       # still open
+            assert not app.agent.think and not cfg.think
+            assert "think = false" in conf.CONFIG_PATH.read_text()
+            await pilot.press("escape")
+            assert not isinstance(app.screen, Palette)
+            # model picker: switching downloads the model if needed and loads it
+            await pilot.press("ctrl+p", *"model", "enter")
+            await wait_for(lambda: isinstance(app.screen, Palette)
+                           and app.screen.title_text == "Switch model", pilot)
+            await pilot.press(*"qwen3.5-4b", "enter")
+            await wait_for(lambda: cfg.model == "qwen3.5:4b" and app.ready, pilot)
+            assert fake.pulled == ["qwen3.5:4b"]
+            assert fake.loaded_model == "qwen3.5:4b"
+            assert cfg.model_label == "Qwen3.5-4B" and cfg.extra["family"] == "qwen"
+            assert 'model = "qwen4b"' in conf.CONFIG_PATH.read_text()
+            # "Unrestricted" jumps to the abliterated twin of the current model
+            await pilot.press("ctrl+p", *"unrestricted", "enter")
+            await wait_for(lambda: cfg.model == "huihui_ai/qwen3.5-abliterated:4b"
+                           and app.ready, pilot)
+            assert 'model = "qwen4b-uncensored"' in conf.CONFIG_PATH.read_text()
+            # chats go to the new model
+            await app._submit("hello")
+            await wait_for(lambda: len(fake.requests) == 1 and not app.agent.busy, pilot)
+            assert fake.requests[0]["model"] == "huihui_ai/qwen3.5-abliterated:4b"
+    # the saved settings load back
+    loaded = conf.load_config()
+    assert loaded.model == "huihui_ai/qwen3.5-abliterated:4b" and not loaded.think
+
+
+def test_save_setting_round_trip():
+    import tinycode.config as conf
+    conf.save_setting("think_budget", 1500)
+    conf.save_setting("model", "qwen9b")
+    conf.save_setting("sandbox", False)
+    conf.save_setting("model_label", "Custom")
+    text = conf.CONFIG_PATH.read_text()
+    assert "think_budget = 1500" in text and "sandbox = false" in text
+    cfg = conf.load_config()
+    assert (cfg.model, cfg.think_budget, cfg.sandbox, cfg.model_label) == \
+        ("qwen3.5:9b", 1500, False, "Custom")
+    conf.save_setting("model_label", None)             # unset → label from the preset
+    assert conf.load_config().model_label == "Qwen3.5-9B"
+    conf.save_setting("think_budget", 0)
+    assert conf.CONFIG_PATH.read_text().count("think_budget") == 1

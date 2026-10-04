@@ -8,7 +8,7 @@
 **A fast, reliable, fully local coding agent for your terminal.**
 
 Talk to it in plain language. It reads your code, edits files, runs commands and tests, and **proves its work runs** before it says it's done.
-It runs on your machine through [Ollama](https://ollama.com) with **LFM2.5-8B-A1B**, and nothing leaves your computer.
+It runs on your machine through [Ollama](https://ollama.com), with **Ling-3.0-tiny** by default or Qwen3.5 or an unrestricted build at the press of `ctrl+p`. Nothing leaves your computer.
 
 </div>
 
@@ -27,10 +27,10 @@ The installer does everything and asks before anything that needs `sudo`:
 | ✓ Python 3.9+ and venv | installed if missing (apt / dnf / pacman / zypper / apk / brew) |
 | ✓ tinycode | in its own virtualenv, with a `tinycode` command in `~/.local/bin` |
 | ✓ Ollama | official installer if missing. It also offers to switch Ollama from always-on to on-demand. |
-| ✓ the model | LFM2.5-8B-A1B, about 5 GB, downloaded once with a progress bar |
+| ✓ a model | pick from a short menu (Ling-3.0-tiny by default, about 5 GB), downloaded once with a progress bar |
 | ✓ extras | Node.js to run and test the web apps it builds, ripgrep for fast search, an app-menu launcher, a default config, and a `doctor` self-check |
 
-Options: `-y` (no questions), `--no-model`, `--no-ollama`, `--model TAG`, `--uninstall [--purge]`.
+Options: `-y` (no questions), `--no-model`, `--no-ollama`, `--model NAME` (a preset such as `qwen4b`, or any Ollama tag), `--uninstall [--purge]`.
 From a clone, run `./install.sh`.
 
 ## Use
@@ -58,8 +58,23 @@ Then just ask:
 | `tinycode --no-sandbox` | let tools reach outside the project directory (off by default) |
 | `tinycode --theme NAME` | colour palette (run `/theme` in the app to browse) |
 | `tinycode --no-think` | turn off reasoning for faster replies |
+| `tinycode --model qwen4b` | use another model for this run (a preset or any Ollama tag) |
+| `tinycode models` | list the recommended models; `tinycode models use qwen9b` makes one the default |
 | `tinycode doctor` | check Python, Ollama, the model, tool support and RAM |
 | `tinycode update` | upgrade in place |
+
+## Settings and models: `ctrl+p`
+
+Press **`ctrl+p`** anywhere for the settings menu. Click a row or use the arrow keys and enter, or type to search. Changes apply immediately and are saved for next time.
+
+<p align="center"><img src="docs/settings.png" width="49%" alt="ctrl+p settings"> <img src="docs/models.png" width="49%" alt="switch model"></p>
+
+- **Switch model:** the recommended models, unrestricted builds, everything you already have in Ollama, or any Ollama tag. A model that isn't downloaded yet is pulled with a progress bar. The old model is unloaded first, so only one sits in RAM.
+- **Unrestricted:** flip the current model to its uncensored twin (refusals removed) and back.
+- **Reasoning** on/off, **reasoning budget**, and **context window** size.
+- **Agent:** permission mode, the project sandbox, and the automatic checks (code checks, web-app runs, tests).
+- **Interface:** sidebar, and expanded reasoning.
+- **Commands:** new, resume, undo, compact, diff, init, export, help, quit.
 
 ## What makes it good
 
@@ -126,8 +141,9 @@ A file that is still being written in chunks is reported as "unfinished, keep go
 | `shift+tab` | mode: ask → auto-edit → yolo | `/undo` | revert the last turn's file changes |
 | `ctrl+t` | reasoning on/off | `/compact` | summarize to free context |
 | `ctrl+o` | expand tool output and reasoning | `/init` | write a TINYCODE.md for this project |
+| `ctrl+p` | settings, models, commands | `/settings` | same as `ctrl+p` |
 | `ctrl+b` | sidebar | `/diff` | files changed this session |
-| `ctrl+n` | new conversation | `/model` | switch model |
+| `ctrl+n` | new conversation | `/model` | switch model (`/model qwen4b` switches directly) |
 | `ctrl+l` | clear screen | `/cost` | token usage |
 | `ctrl+c` ×2 / `ctrl+q` | quit | `/theme` | switch colour palette |
 |  |  | `/export` | save the conversation as markdown |
@@ -144,11 +160,11 @@ A file that is still being written in chunks is reported as "unfinished, keep go
 
 ```toml
 [model]
-model = "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M"
+model = "ling"         # a preset from `tinycode models`, or any Ollama tag
 num_ctx = 32768        # lower if you're short on RAM
 num_predict = 16384
-temperature = 0.6
 think = true           # reasoning: slower but more accurate
+think_budget = 3000    # max reasoning tokens per step (0 = unlimited)
 tool_mode = "native"   # native: Ollama tool calling · stream: experimental live view
 
 [agent]
@@ -170,13 +186,23 @@ sidebar = true
 theme = "tokyo-night"  # /theme browses all (catppuccin-mocha, nord, gruvbox-dark, dracula, …)
 ```
 
-Every key can also be set with an environment variable, for example `TINYCODE_NUM_CTX=32768` or `TINYCODE_MODE=auto-edit`. `OLLAMA_HOST` is respected. Personal instructions for every project go in `~/.config/tinycode/TINYCODE.md`.
+The `ctrl+p` menu writes to the same file. Every key can also be set with an environment variable, for example `TINYCODE_NUM_CTX=32768` or `TINYCODE_MODE=auto-edit`. `OLLAMA_HOST` is respected. Personal instructions for every project go in `~/.config/tinycode/TINYCODE.md`.
 
-Any Ollama model with tool support works: `tinycode --model qwen3:8b`.
+## Models
 
-## The model
+All of these run on a CPU (faster with a GPU) and fit in 8 GB of RAM, except Qwen3.5-9B, which wants 16 GB. Switch with `ctrl+p`, `tinycode --model KEY`, or `tinycode models use KEY`.
 
-**LFM2.5-8B-A1B** by Liquid AI (LFM Open License v1.0) is a hybrid mixture-of-experts model with about 8B total and 1B active parameters, in the Q4_K_M quantization (about 5 GB). It is built for on-device agents, chaining tool calls and following complex instructions, and supports tool calling in Ollama through llama.cpp. It runs on a CPU, faster with a GPU, and needs 8 GB of RAM or more.
+| Key | Model | Download | Speed on CPU | Good for |
+|---|---|---|---|---|
+| `ling` (default) | [Ling-3.0-tiny](https://huggingface.co/inclusionAI/Ling-3.0-tiny): 7.9B mixture-of-experts, 1.3B active | 5.3 GB | fastest | everyday edits and reliable tool use; weaker on tricky logic |
+| `qwen4b` | Qwen3.5-4B, dense | 3.4 GB | about 3× slower | noticeably better code (LiveCodeBench 55.8) |
+| `qwen9b` | Qwen3.5-9B, dense | 6.6 GB | about 6× slower | the best coder under 10B (LiveCodeBench 65.6, BFCL-v4 66.1) |
+| `lfm` | LFM2.5-8B-A1B: mixture-of-experts, 1.5B active | ~5 GB | fastest | on-device tool calling; weak at code |
+| `ling-official` | inclusionAI's own Ling-3.0-tiny GGUF | ~5 GB | fastest | the same model in the publisher's quantization |
+
+**Unrestricted builds.** `ling-uncensored`, `qwen4b-uncensored` and `qwen9b-uncensored` are community "abliterated" builds with refusals removed. They still call tools normally. In the app, `ctrl+p` → **Unrestricted** switches the current model to its twin and back. They will help with anything, so what you do with them is on you.
+
+Each model family gets its publisher's recommended sampling automatically. Ling and Qwen use temperature 0.6, top_p 0.95, top_k 20 and no repetition penalty, because penalties hurt code where names repeat. Anything you set in `config.toml` wins. Any other Ollama model with tool calling works too: `tinycode --model qwen3:8b`.
 
 ## Troubleshooting
 
@@ -184,7 +210,8 @@ Any Ollama model with tool support works: `tinycode --model qwen3:8b`.
 - The log is at `~/.cache/tinycode/tinycode.log`.
 - **`ollama` not found**: re-run the installer, or install it from https://ollama.com/download.
 - **Out of memory**: lower `num_ctx` in the config, or close other models (`ollama ps`).
-- **Slow replies**: press `ctrl+t` to turn reasoning off.
+- **Slow replies**: press `ctrl+t` to turn reasoning off, or lower the reasoning budget in `ctrl+p`.
+- **Wrong or weak code**: try a stronger model from `ctrl+p` → Switch model, such as `qwen4b` or `qwen9b`.
 - **Uninstall**: `curl -fsSL https://raw.githubusercontent.com/the-priest/tinycode/main/install.sh | bash -s -- --uninstall`
 
 ## Development

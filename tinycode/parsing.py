@@ -578,3 +578,32 @@ def unknown_tool_name(text: str) -> str:
         if isinstance(obj, dict) and isinstance(obj.get("name"), str):
             return "" if canonical_name(obj["name"]) else obj["name"]
     return ""
+
+
+# --------------------------------------------------------- model quirks
+
+_LEAKS = re.compile(r"<\|role_end\|>|<role>[A-Z]+</role>|<｜DSML｜end｜DSML｜>|<\|endoftext\|>|"
+                    r"<\|im_end\|>|<\|eot_id\|>")
+
+
+def strip_leaks(text: str) -> str:
+    """Remove special tokens some models spell out as plain text."""
+    if not text or "<" not in text:
+        return text or ""
+    return _LEAKS.sub("", text)
+
+
+def calls_at_end_of_thinking(thinking: str) -> list[dict]:
+    """Tool calls the model wrote at the very end of its reasoning (it opened
+    <tool_call> before closing </think>). Only a trailing block counts, so
+    calls merely *considered* earlier in the reasoning are ignored."""
+    if not thinking or "<tool_call>" not in thinking:
+        return []
+    t = thinking.rstrip()
+    idx = [m.start() for m in re.finditer(r"<tool_call>", t)]
+    for start in idx:                      # earliest start whose tail is only calls
+        tail = t[start:]
+        calls, rest = extract_text_tool_calls(tail)
+        if calls and len(re.sub(r"\s+", "", rest.replace("</think>", ""))) <= 40:
+            return calls
+    return []

@@ -9,13 +9,14 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from .config import Config, log
 from .context import (COMPACT_PROMPT, build_system_prompt, estimate_tokens, prune,
                       transcript_for_summary)
 from .ollama import ChatStream, Ollama, OllamaError
-from .parsing import (RepetitionGuard, call_complete, extract_text_tool_calls,
+from .parsing import (RepetitionGuard, call_complete, calls_at_end_of_thinking,
+                      extract_text_tool_calls, strip_leaks,
                       missing_required, normalize_native_calls, partial_call,
                       tool_call_start, unknown_tool_name)
 from .tools import EDIT_TOOLS, TOOL_NAMES, TOOL_SCHEMAS, ToolResult, Tools
@@ -80,7 +81,7 @@ class Agent:
         self.workdir = workdir
         self.ui = ui
         self.tools = Tools(workdir, cfg, on_todos=self._on_todos)
-        self.system_prompt, self.memory_files = build_system_prompt(workdir, cfg.tool_mode)
+        self.system_prompt, self.memory_files = build_system_prompt(workdir, cfg.tool_mode, cfg.sandbox)
         self.messages: list[dict] = [{"role": "system", "content": self.system_prompt}]
         self.mode = cfg.mode
         self.think = cfg.think
@@ -111,7 +112,8 @@ class Agent:
             asyncio.run_coroutine_threadsafe(self.ui.todos(todos), loop)
 
     def reset(self) -> None:
-        self.system_prompt, self.memory_files = build_system_prompt(self.workdir, self.cfg.tool_mode)
+        self.system_prompt, self.memory_files = build_system_prompt(
+            self.workdir, self.cfg.tool_mode, self.cfg.sandbox)
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self.tools.todos = []
         self.tools.read_files.clear()
@@ -120,7 +122,8 @@ class Agent:
         self.last_prompt_tokens = 0
 
     def refresh_system_prompt(self) -> None:
-        self.system_prompt, self.memory_files = build_system_prompt(self.workdir, self.cfg.tool_mode)
+        self.system_prompt, self.memory_files = build_system_prompt(
+            self.workdir, self.cfg.tool_mode, self.cfg.sandbox)
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = {"role": "system", "content": self.system_prompt}
 
@@ -164,7 +167,7 @@ class Agent:
                     break
                 await self.ui.step_start(step)
                 await self._fit_context()
-                think = self.think and retries == 0
+                think = self.think and retries < 3
                 nudge = None
                 if last_abort == "broken_call":
                     nudge = ("Your previous tool call was cut off before it was complete, so "
@@ -175,6 +178,13 @@ class Agent:
                     nudge = ("Your previous reply hit the length limit before it finished. "
                              "Try again. If a file is very large you can write it in "
                              "several calls using write_file with append=true.")
+                elif last_abort == "think_budget":
+                    nudge = ("You have thought about this long enough. Decide now: call the ONE "
+                             "tool you need next, or give the final answer. Keep reasoning short.")
+                elif last_abort == "stalled":
+                    nudge = ("Your last reply stopped in the middle of thinking without doing "
+                             "anything. Continue: call the tool you were about to use, or give "
+                             "your answer.")
                 elif retries >= 2:
                     nudge = ("Your previous attempt failed (it got stuck or was empty). "
                              "Respond now: either call ONE tool, or give the final answer "
@@ -202,8 +212,16 @@ class Agent:
                                               "content": res.content.strip() + "\n[interrupted]"})
                     break
 
+                res.content = strip_leaks(res.content)
+                res.thinking = strip_leaks(res.thinking)
                 calls, errors = normalize_native_calls(res.raw_calls)
                 content = res.content
+                if not calls and not errors and not content.strip() and res.thinking:
+                    # Ling-style models often open <tool_call> before closing </think>;
+                    # Ollama then files the call as reasoning and the step looks empty.
+                    calls = calls_at_end_of_thinking(res.thinking)
+                    if calls:
+                        log(f"recovered {len(calls)} tool call(s) from the reasoning channel")
                 if not calls and not errors:
                     calls, content = extract_text_tool_calls(content)
                     if self.stream_tools:
@@ -237,7 +255,8 @@ class Agent:
                 if res.aborted and not calls:
                     retries += 1
                     why = {"repetition": "the model started repeating itself",
-                           "think_budget": "the model over-thought",
+                           "think_budget": f"the model thought for over {self.cfg.think_budget} "
+                                           "tokens without acting",
                            "length": "the reply hit the length limit"}.get(res.aborted, res.aborted)
                     if retries <= 3:
                         await self.ui.notice(f"{why} — retrying with a focused prompt", "warn")
@@ -249,7 +268,7 @@ class Agent:
                 if calls or errors:
                     retries = 0
                     self._step_note = content.strip()
-                    self._record_assistant(content.strip(), calls, res.content)
+                    self._record_assistant(content.strip(), calls, res.content, res.thinking)
                     for err in errors:
                         self._add_result("", f"ERROR: {err}")
                         await self.ui.notice(err.split(".")[0], "warn")
@@ -265,11 +284,18 @@ class Agent:
                 text = content.strip()
                 if not text:
                     retries += 1
-                    if retries <= 2:
+                    last_abort = "stalled" if res.thinking.strip() else ""
+                    if retries <= 3:
+                        if res.thinking.strip():
+                            await self.ui.notice("the model stopped mid-thought — asking it to "
+                                                 "continue", "dim")
                         step -= 1
                         continue
                     text = "(no answer)"
-                self.messages.append({"role": "assistant", "content": text})
+                final_msg = {"role": "assistant", "content": text}
+                if self.cfg.preserve_thinking and res.thinking.strip() and not self.stream_tools:
+                    final_msg["thinking"] = res.thinking.strip()
+                self.messages.append(final_msg)
                 # finish gate: don't let the turn end with broken code
                 if self.cfg.auto_check and gate_rounds < self.cfg.check_rounds \
                         and not self._cancel:
@@ -332,7 +358,9 @@ class Agent:
         budget = int((self.cfg.num_ctx - reserve) / max(self.calib, 0.5))
         if estimate_tokens(self.messages) <= budget:
             return
-        self.messages, n = prune(self.messages, budget)
+        # prune well below the limit in one go: every edit to earlier history forces
+        # a full re-read of the prompt on hybrid/recurrent models, so do it rarely
+        self.messages, n = prune(self.messages, int(budget * 0.6))
         if n:
             self.tools.seen.clear()   # pruned output must be re-readable
             await self.ui.notice("context nearly full — trimmed old tool output", "dim")
@@ -424,6 +452,9 @@ class Agent:
                 await self.ui.thinking_delta(t)
                 if guard.feed(t):
                     res.aborted = "repetition"
+                elif self.cfg.think_budget and \
+                        sum(map(len, thinking)) > self.cfg.think_budget * 4:
+                    res.aborted = "think_budget"
             c = msg.get("content")
             if c:
                 if think_open:
@@ -629,15 +660,29 @@ class Agent:
         self.tools.todos = todos[-12:]
         await self.ui.todos(self.tools.todos)
 
+    def model_changed(self) -> None:
+        """Forget what was measured for the previous model (speed, tokenizer
+        calibration, what Ollama had cached)."""
+        self.calib = 1.0
+        self.rate = 10.0
+        self.prefill_rate = 150.0
+        self._cached_est = 0
+        self.last_prompt_tokens = 0
+        self.client.supports_think = None
+
     def set_tool_mode(self, mode: str) -> None:
         self.cfg.tool_mode = mode
         self.stream_tools = mode == "stream"
         self.refresh_system_prompt()
 
-    def _record_assistant(self, text: str, calls: list[dict], raw: str) -> None:
+    def _record_assistant(self, text: str, calls: list[dict], raw: str,
+                          thinking: str = "") -> None:
         if not self.stream_tools:
-            self.messages.append({"role": "assistant", "content": text,
-                                  "tool_calls": [{"function": c["function"]} for c in calls]})
+            msg = {"role": "assistant", "content": text,
+                   "tool_calls": [{"function": c["function"]} for c in calls]}
+            if self.cfg.preserve_thinking and thinking.strip():
+                msg["thinking"] = thinking.strip()
+            self.messages.append(msg)
             return
         # stream mode: keep the history in the exact text format we ask for
         parts = [text] if text else []

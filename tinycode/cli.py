@@ -4,6 +4,7 @@
   tinycode -p "prompt" [DIR]     headless: run one task, print the answer
   tinycode -c                    continue the last conversation in this dir
   tinycode doctor                check the installation
+  tinycode models [use KEY]      list recommended models / set the default
   tinycode config                create/show the config file
   tinycode update                upgrade tinycode in place
 """
@@ -29,13 +30,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         prog=APP_NAME,
         description="tinycode — a fast, fully local coding agent (Ollama).",
-        epilog="subcommands: doctor · config · update   |   docs: /help inside the app")
+        epilog="subcommands: doctor · models · config · update   |   in the app: ctrl+p, /help")
     ap.add_argument("directory", nargs="?", default=".", help="project directory (default: .)")
     ap.add_argument("-p", "--print", dest="prompt", metavar="PROMPT",
                     help="headless: run PROMPT to completion and print the answer")
     ap.add_argument("-c", "--continue", dest="cont", action="store_true",
                     help="continue the most recent conversation in this directory")
-    ap.add_argument("-m", "--model", help="Ollama model tag to use")
+    ap.add_argument("-m", "--model",
+                    help="a preset (see `tinycode models`) or any Ollama tag")
     ap.add_argument("--mode", choices=["ask", "auto-edit", "yolo"],
                     help="permission mode (default: ask)")
     ap.add_argument("--yolo", action="store_true", help="same as --mode yolo")
@@ -60,7 +62,6 @@ def build_config(args: argparse.Namespace) -> Config:
     over: dict[str, Any] = {}
     if args.model:
         over["model"] = args.model
-        over["model_label"] = args.model.split("/")[-1]
     if args.yolo:
         over["mode"] = "yolo"
     elif args.mode:
@@ -250,6 +251,36 @@ def doctor() -> int:
     return 0 if ok_all else 1
 
 
+def models_cmd(argv: list[str]) -> int:
+    from . import models
+    from .config import save_setting
+    from .ollama import Ollama
+    if argv[:1] == ["use"]:
+        if len(argv) < 2:
+            print("usage: tinycode models use KEY|TAG")
+            return 2
+        name = argv[1]
+        p = models.find(name)
+        save_setting("model", p.key if p else name)
+        save_setting("model_label", None)
+        print(f"default model: {p.label + ' (' + p.tag + ')' if p else name}  →  {CONFIG_PATH}")
+        print("it is downloaded the next time tinycode starts, if needed")
+        return 0
+    cfg = load_config()
+    client = Ollama(cfg)
+    names: set[str] = set()
+    if client.alive(timeout=1.5):
+        names = {m.get("name", "") for m in client.list_models()}
+    print(f"tinycode models  (current: {cfg.model_label} · {cfg.model})\n")
+    print("   key                label                        size      speed       notes")
+    print(models.table(names))
+    print("\n ✓ = downloaded" + ("" if names else " (start ollama to see what is downloaded)"))
+    print(" try one:      tinycode --model qwen4b")
+    print(" make default: tinycode models use qwen4b      (or ctrl+p → Switch model in the app)")
+    print(" any other Ollama model with tool calling works too: tinycode --model qwen3:8b")
+    return 0
+
+
 def update() -> int:
     ref = os.environ.get("TINYCODE_REF", "main")
     url = f"https://github.com/the-priest/tinycode/archive/refs/heads/{ref}.tar.gz"
@@ -262,9 +293,11 @@ def update() -> int:
 
 def main(argv: Optional[list[str]] = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] in ("doctor", "config", "update"):
+    if argv and argv[0] in ("doctor", "config", "update", "models"):
         if argv[0] == "doctor":
             raise SystemExit(doctor())
+        if argv[0] == "models":
+            raise SystemExit(models_cmd(argv[1:]))
         if argv[0] == "config":
             print(write_default_config())
             raise SystemExit(0)

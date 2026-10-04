@@ -38,10 +38,7 @@ SYSTEM_PROMPT = """You are tinycode, an expert software engineer working as a co
 - Act with tools instead of describing what you would do. Don't ask for permission; the user approves risky actions themselves.
 - edit_file: copy old_string exactly from the file WITHOUT the line-number prefix, with 2-3 lines of context so it is unique.
 - Paths are relative to the project root.
-- You are sandboxed to the project root: never read, write, list or run anything
-  outside it (no ../, ~, /etc, /tmp, $HOME). If a task truly needs that, stop and
-  ask the user to do it instead.
-- If a tool returns ERROR, read the message and correct your next call. Don't repeat a failing call unchanged.
+{sandbox}- If a tool returns ERROR, read the message and correct your next call. Don't repeat a failing call unchanged.
 - Never invent file contents, command output or results.
 - Simple questions that need no files: answer directly, no tools.
 - Keep replies short: a few lines of markdown. Match the existing code style.{memory}"""
@@ -205,14 +202,21 @@ Let me look at the main module first.
 </tool_call>"""
 
 
-def build_system_prompt(cwd: Path, tool_mode: str = "stream") -> tuple[str, list[str]]:
+SANDBOX_RULE = """- You are sandboxed to the project root: never read, write, list or run anything
+  outside it (no ../, ~, /etc, /tmp, $HOME). If a task truly needs that, stop and
+  ask the user to do it instead.
+"""
+
+
+def build_system_prompt(cwd: Path, tool_mode: str = "stream",
+                        sandbox: bool = True) -> tuple[str, list[str]]:
     memory, used = load_memory(cwd)
     mem = f"\n\n# Project instructions (follow these)\n{memory}" if memory else ""
     osname = f"{platform.system()} {platform.release()}".strip()
     prompt = SYSTEM_PROMPT.format(
         cwd=str(cwd), os=osname, date=time.strftime("%Y-%m-%d"),
         git=_git_info(cwd), listing=_listing(cwd), project=detect_project(cwd),
-        memory="")
+        sandbox=SANDBOX_RULE if sandbox else "", memory="")
     if tool_mode == "stream":
         prompt += tools_prompt()
     return prompt + mem, used
@@ -225,8 +229,8 @@ _SCHEMA_CHARS = len(json.dumps(TOOL_SCHEMAS))
 
 
 def estimate_tokens(messages: list[dict], with_tools: bool = True) -> int:
-    chars = sum(len(m.get("content") or "") + len(json.dumps(m.get("tool_calls") or ""))
-                + 12 for m in messages)
+    chars = sum(len(m.get("content") or "") + len(m.get("thinking") or "")
+                + len(json.dumps(m.get("tool_calls") or "")) + 12 for m in messages)
     if with_tools:
         chars += _SCHEMA_CHARS
     return int(chars / CHARS_PER_TOKEN)
@@ -250,6 +254,14 @@ def prune(messages: list[dict], budget: int, keep_recent_tools: int = 4) -> tupl
     changes = 0
     if estimate_tokens(msgs) <= budget:
         return msgs, 0
+
+    # cheapest first: drop kept reasoning from all but the latest assistant messages
+    asst = [i for i, m in enumerate(msgs) if m.get("role") == "assistant" and m.get("thinking")]
+    for i in asst[:-2]:
+        msgs[i] = {k: v for k, v in msgs[i].items() if k != "thinking"}
+        changes += 1
+    if changes and estimate_tokens(msgs) <= budget:
+        return msgs, changes
 
     tool_idx = [i for i, m in enumerate(msgs) if is_tool_result(m)]
     for i in tool_idx[:-keep_recent_tools] if keep_recent_tools else tool_idx:

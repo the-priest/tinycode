@@ -11,7 +11,7 @@
 #    • tinycode in its own virtualenv    ~/.local/share/tinycode/venv
 #    • the `tinycode` command            ~/.local/bin/tinycode
 #    • Ollama                            (if missing)
-#    • the LFM2.5-8B-A1B model          (~5 GB, one-time download)
+#    • a model of your choice            (Ling-3.0-tiny by default, ~5 GB, one time)
 #    • ripgrep (fast search), a desktop launcher, a default config
 #
 #  Options:
@@ -19,7 +19,8 @@
 #    --no-model         don't download the model now (tinycode will on first run)
 #    --no-ollama        don't install Ollama
 #    --no-desktop       don't create the app-menu launcher
-#    --model TAG        use a different Ollama model
+#    --model NAME       a preset (ling, qwen4b, qwen9b, ling-uncensored,
+#                       qwen4b-uncensored, qwen9b-uncensored, lfm) or any Ollama tag
 #    --uninstall        remove tinycode (keeps your config + sessions)
 #    --purge            with --uninstall: also delete config + sessions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,7 +28,7 @@ set -euo pipefail
 
 REPO="the-priest/tinycode"
 REF="${TINYCODE_REF:-main}"
-MODEL="${TINYCODE_MODEL:-hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M}"
+MODEL="${TINYCODE_MODEL:-}"   # empty = ask (default: ling)
 PREFIX="${TINYCODE_HOME:-$HOME/.local/share/tinycode}"
 VENV="$PREFIX/venv"
 BIN_DIR="$HOME/.local/bin"
@@ -40,10 +41,10 @@ while [ $# -gt 0 ]; do
     --no-model) WANT_MODEL=0 ;;
     --no-ollama) WANT_OLLAMA=0 ;;
     --no-desktop) WANT_DESKTOP=0 ;;
-    --model) shift; MODEL="${1:?--model needs a tag}" ;;
+    --model) shift; MODEL="${1:?--model needs a name}" ;;
     --uninstall) UNINSTALL=1 ;;
     --purge) PURGE=1 ;;
-    -h|--help) sed -n '2,27p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -121,11 +122,59 @@ if [ "$UNINSTALL" = 1 ]; then
   else
     info "kept config ($CONFIG_DIR) and sessions ($PREFIX/sessions); use --purge to delete"
   fi
-  info "Ollama and downloaded models were left in place (remove with: ollama rm $MODEL)"
+  info "Ollama and downloaded models were left in place (see: ollama list / ollama rm NAME)"
   exit 0
 fi
 
 banner
+
+# ── 0. pick a model ──────────────────────────────────────────────────────────
+# preset key → Ollama tag and download size (same presets as `tinycode models`)
+model_tag() {
+  case "$1" in
+    ling)              echo "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL" ;;
+    ling-official)     echo "hf.co/inclusionAI/Ling-3.0-tiny-GGUF:Q4_K_M" ;;
+    qwen4b)            echo "qwen3.5:4b" ;;
+    qwen9b)            echo "qwen3.5:9b" ;;
+    lfm)               echo "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M" ;;
+    ling-uncensored)   echo "hf.co/mradermacher/Ling-3.0-tiny-uncensored-abliterated-GGUF:Q4_K_M" ;;
+    qwen4b-uncensored) echo "huihui_ai/qwen3.5-abliterated:4b" ;;
+    qwen9b-uncensored) echo "huihui_ai/qwen3.5-abliterated:9b" ;;
+    *)                 echo "$1" ;;
+  esac
+}
+model_size() {
+  case "$1" in
+    qwen4b*) echo "~3.4 GB" ;; qwen9b*) echo "~6.6 GB" ;; ling) echo "~5.3 GB" ;;
+    ling*|lfm) echo "~5 GB" ;; *) echo "a few GB" ;;
+  esac
+}
+
+CHOSEN=0
+if [ -z "$MODEL" ]; then
+  MODEL=ling
+  if [ "$YES" != 1 ] && { : </dev/tty; } 2>/dev/null; then
+    step "Choose a model (switch any time in the app with ctrl+p)"
+    printf '\n' >&2
+    printf '   %s1%s  Ling-3.0-tiny          %sfastest · 5.3 GB · good tool use · default%s\n' "$B" "$N" "$D" "$N" >&2
+    printf '   %s2%s  Qwen3.5-4B             %sbetter at code · 3.4 GB · ~3x slower%s\n' "$B" "$N" "$D" "$N" >&2
+    printf '   %s3%s  Qwen3.5-9B             %sbest coder under 10B · 6.6 GB · ~6x slower · 16 GB RAM%s\n' "$B" "$N" "$D" "$N" >&2
+    printf '\n   %sunrestricted (refusals removed):%s\n' "$D" "$N" >&2
+    printf '   %s4%s  Ling-3.0-tiny          %sfastest · ~5 GB%s\n' "$B" "$N" "$D" "$N" >&2
+    printf '   %s5%s  Qwen3.5-4B             %sbetter at code · 3.4 GB%s\n' "$B" "$N" "$D" "$N" >&2
+    printf '   %s6%s  Qwen3.5-9B             %sbest coder · 6.6 GB%s\n\n' "$B" "$N" "$D" "$N" >&2
+    printf '  %s?%s Model [1]: ' "$C" "$N" >&2
+    read -r pick </dev/tty || pick=""
+    case "${pick:-1}" in
+      2) MODEL=qwen4b ;; 3) MODEL=qwen9b ;; 4) MODEL=ling-uncensored ;;
+      5) MODEL=qwen4b-uncensored ;; 6) MODEL=qwen9b-uncensored ;; *) MODEL=ling ;;
+    esac
+    CHOSEN=1
+  fi
+else
+  CHOSEN=1
+fi
+MODEL_TAG="$(model_tag "$MODEL")"
 
 # ── 1. Python ────────────────────────────────────────────────────────────────
 step "Python"
@@ -211,13 +260,13 @@ case ":$PATH:" in
     ;;
 esac
 
-# default config
+# config: create the default one; save the model if one was picked
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
   "$VENV/bin/tinycode" config >/dev/null
-  if [ "$MODEL" != "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M" ]; then
-    sed -i.bak "s|^#\{0,1\} \{0,1\}model = .*|model = \"$MODEL\"|; s|^#\{0,1\} \{0,1\}model_label = .*|model_label = \"${MODEL##*/}\"|" "$CONFIG_DIR/config.toml" && rm -f "$CONFIG_DIR/config.toml.bak"
-  fi
   ok "config → $CONFIG_DIR/config.toml"
+fi
+if [ "$CHOSEN" = 1 ]; then
+  "$VENV/bin/tinycode" models use "$MODEL" >/dev/null && ok "default model: $MODEL"
 fi
 
 # ── 3. ripgrep (optional, makes search fast) ─────────────────────────────────
@@ -282,7 +331,7 @@ fi
 
 # ── 5. the model ─────────────────────────────────────────────────────────────
 if [ -n "$OLLAMA" ] && [ "$WANT_MODEL" = 1 ]; then
-  step "Model: $MODEL"
+  step "Model: $MODEL_TAG"
   STARTED=""
   if ! curl -fsS --max-time 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
     "$OLLAMA" serve >/dev/null 2>&1 &
@@ -292,10 +341,10 @@ if [ -n "$OLLAMA" ] && [ "$WANT_MODEL" = 1 ]; then
       sleep 0.2
     done
   fi
-  if "$OLLAMA" list 2>/dev/null | awk '{print $1}' | grep -qxF "$MODEL"; then
+  if "$OLLAMA" list 2>/dev/null | awk '{print $1}' | grep -qxF "$MODEL_TAG"; then
     ok "already downloaded"
-  elif ask "Download the model now (~5.3 GB, one time)?" y; then
-    "$OLLAMA" pull "$MODEL" && ok "model ready" || warn "download failed — tinycode will retry on first run"
+  elif ask "Download the model now ($(model_size "$MODEL"), one time)?" y; then
+    "$OLLAMA" pull "$MODEL_TAG" && ok "model ready" || warn "download failed — tinycode will retry on first run"
   else
     info "tinycode will download it on first run"
   fi
@@ -329,6 +378,8 @@ step "Checking the installation"
 printf '\n%s✓ tinycode is installed!%s\n\n' "$G$B" "$N" >&2
 printf '  %scd your-project && tinycode%s      start coding\n' "$B" "$N" >&2
 printf '  %stinycode -p "explain this repo"%s  one-shot, prints the answer\n' "$B" "$N" >&2
+printf '  %sctrl+p%s inside the app            settings, switch model, unrestricted mode\n' "$B" "$N" >&2
+printf '  %stinycode models%s                  recommended models\n' "$B" "$N" >&2
 printf '  %stinycode doctor%s                  diagnose problems\n' "$B" "$N" >&2
 printf '  %stinycode update%s                  upgrade\n\n' "$B" "$N" >&2
 if [ "${NEED_NEW_SHELL:-0}" = 1 ]; then

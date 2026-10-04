@@ -1,4 +1,3 @@
-import sys
 
 from fake_ollama import FakeOllama
 from tinycode.cli import build_config, main, parse_args, run_headless
@@ -46,3 +45,28 @@ def test_config_subcommand(capsys):
     except SystemExit as e:
         assert e.code == 0
     assert "config.toml" in capsys.readouterr().out
+
+
+def test_installer_presets_match_models():
+    """install.sh has its own copy of the preset → tag map; keep them equal."""
+    import re
+    from pathlib import Path
+    from tinycode import models
+    sh = (Path(__file__).parent.parent / "install.sh").read_text()
+    block = sh[sh.index("model_tag() {"):sh.index("model_size() {")]
+    pairs = dict(re.findall(r'^\s+([\w-]+)\)\s+echo "([^"]+)"', block, re.M))
+    assert pairs == {p.key: p.tag for p in models.PRESETS}
+
+
+def test_models_command_sets_default(capsys):
+    import tinycode.config as conf
+    from tinycode.cli import main
+    import pytest
+    with pytest.raises(SystemExit) as e:
+        main(["models", "use", "qwen4b-uncensored"])
+    assert e.value.code == 0
+    assert conf.load_config().model == "huihui_ai/qwen3.5-abliterated:4b"
+    with pytest.raises(SystemExit):
+        main(["models"])
+    out = capsys.readouterr().out
+    assert "qwen9b-uncensored" in out and "Qwen3.5-4B (uncensored)" in out

@@ -6,7 +6,7 @@ A fully local terminal coding agent (Python + Textual, talks to Ollama).
 - Dev install: `python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"`
 - Run: `.venv/bin/tinycode [DIR]` (`--no-boot` to try the UI without Ollama)
 - Tests: `.venv/bin/python -m pytest -q`; one test: `pytest tests/test_edits.py::test_exact`
-- Installer check: `bash -n install.sh`
+- Installer check: `bash -n install.sh` (its preset map must match `models.PRESETS`; a test checks this)
 
 ## Layout
 - `tinycode/agent.py` — the agent loop (UI-agnostic, `AgentUI` callbacks)
@@ -17,8 +17,10 @@ A fully local terminal coding agent (Python + Textual, talks to Ollama).
 - `tinycode/parsing.py` — tool-call normalization, text tool-call recovery, loop detection
 - `tinycode/context.py` — system prompt, project memory, context pruning, @mentions
 - `tinycode/ollama.py` — Ollama HTTP client and server/model lifecycle
-- `tinycode/tui/` — Textual app (`app.py`), widgets/modals (`widgets.py`), colour themes (`theme.py`)
-- `tinycode/cli.py` — argument parsing, headless `-p` mode, `doctor`
+- `tinycode/models.py` — model presets (incl. unrestricted builds) and per-family sampling
+- `tinycode/config.py` — `Config`, `load_config` (file → env → CLI), `save_setting` (used by the ctrl+p settings)
+- `tinycode/tui/` — Textual app (`app.py`), widgets/modals incl. the ctrl+p `Palette` (`widgets.py`), colour themes (`theme.py`)
+- `tinycode/cli.py` — argument parsing, headless `-p` mode, `doctor`, `models`
 - `tests/fake_ollama.py` — scripted fake Ollama server used by the tests
 
 ## Style

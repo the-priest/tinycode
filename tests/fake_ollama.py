@@ -26,6 +26,9 @@ class FakeOllama:
         self.installed = installed
         self.requests: list[dict] = []
         self.loaded = False
+        self.loaded_model = model
+        self.others: list[str] = []      # more installed models (pulled at runtime)
+        self.pulled: list[str] = []
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -44,10 +47,10 @@ class FakeOllama:
                 if self.path == "/api/version":
                     self._json({"version": "0.99.0-fake"})
                 elif self.path == "/api/tags":
-                    self._json({"models": [{"name": outer.model, "size": 5_300_000_000}]
-                                if outer.installed else []})
+                    names = ([outer.model] if outer.installed else []) + outer.others
+                    self._json({"models": [{"name": n, "size": 5_300_000_000} for n in names]})
                 elif self.path == "/api/ps":
-                    self._json({"models": [{"name": outer.model, "size": 5_100_000_000,
+                    self._json({"models": [{"name": outer.loaded_model, "size": 5_100_000_000,
                                             "size_vram": 0}] if outer.loaded else []})
                 else:
                     self._json({"error": "not found"}, 404)
@@ -56,7 +59,12 @@ class FakeOllama:
                 n = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(n) or b"{}")
                 if self.path == "/api/generate":
-                    outer.loaded = payload.get("keep_alive") != 0
+                    name = payload.get("model") or outer.model
+                    if payload.get("keep_alive") == 0:
+                        if name == outer.loaded_model:
+                            outer.loaded = False
+                    else:
+                        outer.loaded, outer.loaded_model = True, name
                     self._json({"done": True})
                 elif self.path == "/api/show":
                     self._json({"capabilities": ["completion", "tools", "thinking"]})
@@ -67,7 +75,12 @@ class FakeOllama:
                         self.wfile.write(json.dumps({"status": "pulling", "total": 100,
                                                      "completed": i}).encode() + b"\n")
                     self.wfile.write(b'{"status":"success"}\n')
-                    outer.installed = True
+                    name = payload.get("model") or outer.model
+                    outer.pulled.append(name)
+                    if name == outer.model:
+                        outer.installed = True
+                    elif name not in outer.others:
+                        outer.others.append(name)
                 elif self.path == "/api/chat":
                     outer.requests.append(payload)
                     self._chat(payload)
