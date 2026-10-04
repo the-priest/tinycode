@@ -30,6 +30,7 @@ SYSTEM_PROMPT = """You are tinycode, an expert software engineer working as a co
 
 # Rules
 - Before each tool call, say in one short sentence what you are about to do.
+- Write files in small chunks of about 80 lines: write_file with the first chunk, then write_file with append=true for each next chunk, until the file is complete.
 - Act with tools instead of describing what you would do. Don't ask for permission; the user approves risky actions themselves.
 - edit_file: copy old_string exactly from the file WITHOUT the line-number prefix, with 2-3 lines of context so it is unique.
 - Paths are relative to the project root.

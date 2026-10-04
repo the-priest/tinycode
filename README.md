@@ -70,7 +70,7 @@ Then just ask:
 - **Context that doesn't overflow.** Old tool output is pruned automatically as the context window fills, the token estimate is calibrated against the model's real token counts, and `/compact` summarizes the conversation on demand.
 - **Fast.** The system prompt stays fixed for the whole session, so Ollama can reuse its cache between steps. Reasoning can be switched off with `ctrl+t`. The only dependency is Textual.
 
-**You see the work.** The model says in one line what it's doing before each step. Edits show a side-by-side before/after diff, new files show a syntax-highlighted preview, and command output streams live. While Ollama holds back a tool call that is still being written, such as a whole file, the status line shows how many tokens have been generated so far. An experimental `tool_mode = "stream"` setting shows files as they are written, but it depends on the model using a tool-call format tinycode can read.
+**You see the work.** The model says in one line what it's doing before each step, and it writes files in chunks of about 80 lines, so you watch a file grow instead of waiting for all of it. Edits show a side-by-side before/after diff, new files show a syntax-highlighted preview, and command output streams live. While Ollama holds back a tool call that is still being written, such as a whole file, the status line shows how many tokens have been generated so far. An experimental `tool_mode = "stream"` setting shows files as they are written, but it depends on the model using a tool-call format tinycode can read.
 
 **Safe by default.**
 - Every file edit shows a coloured diff before it is applied. You can answer *Yes*, *Yes, don't ask again*, or *No, and tell it what to do instead*.

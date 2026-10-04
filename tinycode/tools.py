@@ -119,8 +119,9 @@ TOOL_SCHEMAS: list[dict] = [
              "replace_all": {"type": "boolean", "description": "replace every occurrence"}},
             ["path", "old_string", "new_string"]),
     _schema("write_file",
-            "Create a new file with its full content, or completely overwrite one. Prefer "
-            "edit_file for small changes. append=true adds to the end of an existing file.",
+            "Create or overwrite a file. Write big files in chunks of ~80 lines: the first "
+            "chunk normally, each next chunk with append=true. Prefer edit_file for small "
+            "changes.",
             {"path": {"type": "string"}, "content": {"type": "string"},
              "append": {"type": "boolean", "description": "add to the end instead of overwriting"}},
             ["path", "content"]),

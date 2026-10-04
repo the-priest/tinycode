@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, Optional
 
 from rich.console import Group
@@ -418,19 +420,21 @@ class ToolCallView(Vertical):
         if r is None:
             return
         body: Any = None
+        appended = self.tool == "write_file" and r.ok and bool(self.args.get("append"))
         new_file = self.tool == "write_file" and r.ok and r.diff and \
             "@@ -0,0 " in r.diff
-        if new_file:
-            code = str(self.args.get("content", ""))
-            if self.args.get("append"):
-                body = render_any_diff(r.diff, self._width(), self.expanded)
-            else:
-                lines = code.split("\n")
-                n = len(lines) if self.expanded else 20
-                body = _code("\n".join(lines[:n]), str(self.args.get("path", "")))
-                if len(lines) > n:
-                    body = Group(body, Text(f"   … {len(lines) - n} more lines (ctrl+o)",
-                                            style=T.MUTED))
+        if appended or new_file:
+            code = str(self.args.get("content", "")).rstrip("\n")
+            lines = code.split("\n")
+            start = 1
+            m = re.search(r"now (\d+) lines", r.output)
+            if appended and m:
+                start = max(1, int(m.group(1)) - len(lines) + 1)
+            n = len(lines) if self.expanded else 20
+            body = _code("\n".join(lines[:n]), str(self.args.get("path", "")), start)
+            if len(lines) > n:
+                body = Group(body, Text(f"   … {len(lines) - n} more lines (ctrl+o)",
+                                        style=T.MUTED))
         elif r.diff:
             body = render_any_diff(r.diff, self._width(), self.expanded)
         elif r.detail or not r.ok:
