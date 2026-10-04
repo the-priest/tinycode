@@ -35,6 +35,11 @@ def test_flags():
     assert build_config(parse_args(["--no-sandbox"])).sandbox is False
 
 
+def test_theme_flag():
+    assert build_config(parse_args(["--theme", "gruvbox"])).theme == "gruvbox-dark"
+    assert build_config(parse_args(["--theme", "tokyo-night"])).theme == "tokyo-night"
+
+
 def test_config_subcommand(capsys):
     try:
         main(["config"])

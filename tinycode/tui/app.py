@@ -24,15 +24,16 @@ from textual.widgets.option_list import Option
 
 from .. import APP_NAME, __version__
 from ..agent import Agent, AgentUI, Decision
-from ..config import Config, log, log_path, write_default_config
+from ..config import Config, log, log_path, save_theme, write_default_config
 from ..context import expand_mentions, git_branch
 from ..ollama import Ollama, OllamaError
 from ..parsing import extract_text_tool_calls, is_tool_result, is_user_turn
 from ..session import Session, ago, list_sessions
 from ..tools import IGNORED_DIRS, ToolResult
 from . import theme as T
-from .widgets import (ApprovalScreen, PickerScreen, PromptInput, ToolCallView, short,
-                      tool_target)
+from .widgets import (ApprovalScreen, PickerScreen, PromptInput, ToolCallView,
+                      CSS_BUILDERS as WIDGET_CSS_BUILDERS, rebuild_default_css,
+                      short, tool_target)
 
 LOGO = ["▀█▀ █ █▄ █ █▄█ █▀▀ █▀█ █▀▄ █▀▀",
         " █  █ █ ▀█  █  █▄▄ █▄█ █▄▀ ██▄"]
@@ -58,6 +59,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/init", "create a TINYCODE.md guide for this project"),
     ("/diff", "show files changed this session (git diff)"),
     ("/model", "show or switch the Ollama model"),
+    ("/theme", "change the colour palette"),
     ("/cost", "token usage for this session"),
     ("/export", "save the conversation as markdown"),
     ("/config", "open the path of the config file"),
@@ -262,11 +264,9 @@ class Bridge(AgentUI):
         pass
 
 
-class TinyCodeApp(App):
-    TITLE = APP_NAME
-    ENABLE_COMMAND_PALETTE = False
-
-    CSS = f"""
+def app_css() -> str:
+    """The application stylesheet, rebuilt whenever the palette changes."""
+    return f"""
     Screen {{ background: {T.BG}; color: {T.TEXT}; layers: base overlay; }}
     #topbar {{ height: 1; background: {T.PANEL}; color: {T.TEXT_SOFT}; padding: 0 1; }}
     #body {{ height: 1fr; }}
@@ -316,6 +316,18 @@ class TinyCodeApp(App):
     .side-panel {{ height: auto; margin: 0 0 1 0; }}
     """
 
+
+# CSS source locations ("ClassName.CSS") -> rebuild function, used to re-tint
+# every stylesheet when the palette changes at runtime.
+CSS_BUILDERS = {"TinyCodeApp.CSS": app_css, **WIDGET_CSS_BUILDERS}
+
+
+class TinyCodeApp(App):
+    TITLE = APP_NAME
+    ENABLE_COMMAND_PALETTE = False
+
+    CSS = app_css()
+
     BINDINGS = [
         Binding("ctrl+q", "quit", "quit", priority=True),
         Binding("ctrl+d", "quit", show=False, priority=True),
@@ -333,6 +345,10 @@ class TinyCodeApp(App):
                  resume: Optional[Session] = None, initial_prompt: Optional[str] = None):
         super().__init__()
         self.cfg = cfg
+        # apply the saved palette before any widget is built
+        T.set_theme(cfg.theme)
+        rebuild_default_css()
+        self.CSS = app_css()
         self.workdir = workdir
         self.no_boot = no_boot
         self.client = Ollama(cfg)
@@ -645,9 +661,10 @@ class TinyCodeApp(App):
         t = Text(text, style=T.TEXT)
         await self.emit(Static(t, classes="user"))
 
-    async def replay(self, messages: list[dict]) -> None:
+    async def replay(self, messages: list[dict], notice: bool = True) -> None:
         """Re-render a resumed conversation."""
-        await self.bridge.notice(f"resumed session · {sum(1 for m in messages if m.get('role') == 'user')} turns", "dim")
+        if notice:
+            await self.bridge.notice(f"resumed session · {sum(1 for m in messages if m.get('role') == 'user')} turns", "dim")
         pending: list[ToolCallView] = []
         for m in messages:
             role = m.get("role")
@@ -1137,6 +1154,8 @@ class TinyCodeApp(App):
             await note(f"config: {p}  (restart tinycode after editing)", "info")
         elif cmd == "/model":
             await self._model(arg)
+        elif cmd == "/theme":
+            await self._theme(arg)
         elif cmd == "/resume":
             await self._resume()
         else:
@@ -1233,6 +1252,55 @@ class TinyCodeApp(App):
         self.push_screen(PickerScreen(title, items),
                          callback=lambda r: fut.done() or fut.set_result(r))
         return await fut
+
+    # ------------------------------------------------------------- themes
+    async def _theme(self, arg: str) -> None:
+        if arg:
+            if not T.is_theme(arg):
+                await self.bridge.notice(f"unknown theme {arg} — run /theme to pick one", "warn")
+                return
+            await self.apply_theme(arg)
+            return
+        current = T.active()
+        items = [(n, f"{n}{'  ✓' if n == current else ''}   ·  {T.description(n)}")
+                 for n in T.NAMES]
+        choice = await self._pick("Colour theme", items)
+        if choice and choice != current:
+            await self.apply_theme(choice)
+
+    def _retint_css(self) -> None:
+        """Point every stylesheet source at the freshly built palette."""
+        ss = self.stylesheet
+        for read_from, src in list(ss.source.items()):
+            name = read_from[1] if isinstance(read_from, tuple) and len(read_from) == 2 else ""
+            build = CSS_BUILDERS.get(name)
+            if build is not None:
+                ss.add_source(build(), read_from=read_from, is_default_css=src.is_defaults,
+                              tie_breaker=src.tie_breaker, scope=src.scope)
+        try:
+            self.refresh_css()
+        except Exception as exc:  # noqa: BLE001
+            log(f"theme: css refresh failed: {exc}")
+
+    async def apply_theme(self, name: str) -> None:
+        """Switch palette live, persist the choice and repaint the screen."""
+        name = T.set_theme(name)
+        self.cfg.theme = name
+        rebuild_default_css()
+        self.CSS = app_css()
+        self._retint_css()
+        self.refresh_chrome()
+        self.refresh_side()
+        try:
+            save_theme(name)
+        except OSError:
+            pass
+        if not self.agent.busy:
+            await self.log_view.remove_children()
+            await self._welcome()
+            if len(self.agent.messages) > 1:
+                await self.replay(self.agent.messages, notice=False)
+        await self.bridge.notice(f"theme: {name} · {T.description(name)}", "ok")
 
     async def _resume(self) -> None:
         items = await asyncio.to_thread(list_sessions, str(self.workdir))

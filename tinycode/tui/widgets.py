@@ -48,11 +48,11 @@ def render_diff(diff: str, max_lines: int = 80) -> Text:
             continue
         if line.startswith("+"):
             out.append(f"{new_no:>5} ", style=T.MUTED)
-            out.append("+ " + line[1:] + "\n", style=f"{T.GREEN} on #16261a")
+            out.append("+ " + line[1:] + "\n", style=f"{T.GREEN} on {T.GREEN_BG}")
             new_no += 1
         elif line.startswith("-"):
             out.append(f"{old_no:>5} ", style=T.MUTED)
-            out.append("- " + line[1:] + "\n", style=f"{T.RED} on #2a1619")
+            out.append("- " + line[1:] + "\n", style=f"{T.RED} on {T.RED_BG}")
             old_no += 1
         else:
             out.append(f"{new_no:>5} ", style=T.DIM)
@@ -223,7 +223,7 @@ def _code(code: str, path: str, start: int = 1) -> Syntax:
         lexer = Syntax.guess_lexer(path or "x.txt", code)
     except Exception:  # noqa: BLE001
         lexer = "text"
-    return Syntax(code, lexer, theme="monokai", line_numbers=True, start_line=start,
+    return Syntax(code, lexer, theme=T.SYNTAX, line_numbers=True, start_line=start,
                   background_color=T.BG, word_wrap=False, indent_guides=False)
 
 
@@ -287,8 +287,8 @@ def render_split_diff(diff: str, max_rows: int = 60) -> Table:
         if kind == "ctx":
             tbl.add_row(str(on), Text(ot, style=T.TEXT_SOFT), str(nn), Text(nt, style=T.TEXT_SOFT))
             continue
-        left = Text(ot, style=f"{T.RED} on #2a1619") if on is not None else Text("")
-        right = Text(nt, style=f"{T.GREEN} on #16261a") if nn is not None else Text("")
+        left = Text(ot, style=f"{T.RED} on {T.RED_BG}") if on is not None else Text("")
+        right = Text(nt, style=f"{T.GREEN} on {T.GREEN_BG}") if nn is not None else Text("")
         tbl.add_row("" if on is None else str(on), left, "" if nn is None else str(nn), right)
     if len(rows) > max_rows:
         tbl.add_row("", Text(f"… {len(rows) - max_rows} more rows (ctrl+o)", style=T.MUTED), "", "")
@@ -301,11 +301,8 @@ def render_any_diff(diff: str, width: int, expanded: bool) -> Any:
     return render_diff(diff, 400 if expanded else 40)
 
 
-class ToolCallView(Vertical):
-    """⏺ Edit(src/app.py)
-         ⎿ +3 -1   then a diff, a code preview or the command output"""
-
-    DEFAULT_CSS = f"""
+def toolcall_css() -> str:
+    return f"""
     ToolCallView {{ height: auto; margin: 1 0 0 0; }}
     ToolCallView .tc-head {{ height: auto; }}
     ToolCallView .tc-sum {{ height: auto; color: {T.MUTED}; padding: 0 0 0 2; }}
@@ -314,6 +311,13 @@ class ToolCallView(Vertical):
     ToolCallView .tc-body.-expanded {{ max-height: 300; }}
     ToolCallView .tc-live {{ height: auto; max-height: 24; padding: 0 0 0 4; color: {T.MUTED}; }}
     """
+
+
+class ToolCallView(Vertical):
+    """⏺ Edit(src/app.py)
+         ⎿ +3 -1   then a diff, a code preview or the command output"""
+
+    DEFAULT_CSS = toolcall_css()
 
     def __init__(self, name: str, args: dict, expanded: bool = False) -> None:
         super().__init__()
@@ -499,10 +503,8 @@ def short_block(text: str, n: int) -> str:
 
 # ------------------------------------------------------------- modals
 
-class ApprovalScreen(ModalScreen):
-    """Permission prompt: yes / always / no with feedback."""
-
-    DEFAULT_CSS = f"""
+def approval_css() -> str:
+    return f"""
     ApprovalScreen {{ align: center bottom; background: {T.BG} 20%; }}
     #ap {{ width: 100%; max-width: 140; height: auto; max-height: 90%;
            background: {T.PANEL}; border: round {T.YELLOW}; padding: 0 2;
@@ -516,6 +518,12 @@ class ApprovalScreen(ModalScreen):
     #ap-opts > .option-list--option-highlighted {{ background: {T.DIM}; }}
     #ap-fb {{ display: none; margin: 0 0 1 0; }}
     """
+
+
+class ApprovalScreen(ModalScreen):
+    """Permission prompt: yes / always / no with feedback."""
+
+    DEFAULT_CSS = approval_css()
 
     BINDINGS = [
         Binding("1,y", "pick(0)", show=False),
@@ -607,10 +615,8 @@ class ApprovalScreen(ModalScreen):
         self.dismiss(("no", ev.value))
 
 
-class PickerScreen(ModalScreen):
-    """Generic list picker (sessions, models)."""
-
-    DEFAULT_CSS = f"""
+def picker_css() -> str:
+    return f"""
     PickerScreen {{ align: center middle; background: {T.BG} 60%; }}
     #pk {{ width: 90; max-width: 95%; height: auto; max-height: 80%;
            background: {T.PANEL}; border: round {T.BLUE}; padding: 1 2; }}
@@ -618,6 +624,12 @@ class PickerScreen(ModalScreen):
     #pk-list {{ height: auto; max-height: 30; background: {T.PANEL}; border: none; }}
     #pk-hint {{ color: {T.MUTED}; margin: 1 0 0 0; }}
     """
+
+
+class PickerScreen(ModalScreen):
+    """Generic list picker (sessions, models)."""
+
+    DEFAULT_CSS = picker_css()
     BINDINGS = [Binding("escape", "close", show=False)]
 
     def __init__(self, title: str, items: list[tuple[str, str]]):
@@ -640,4 +652,19 @@ class PickerScreen(ModalScreen):
 
     def action_close(self) -> None:
         self.dismiss(None)
+
+
+# Maps the CSS source location ("ClassName.DEFAULT_CSS") to the function that
+# rebuilds it, so the app can re-tint every widget when the theme changes.
+CSS_BUILDERS = {
+    "ToolCallView.DEFAULT_CSS": toolcall_css,
+    "ApprovalScreen.DEFAULT_CSS": approval_css,
+    "PickerScreen.DEFAULT_CSS": picker_css,
+}
+
+
+def rebuild_default_css() -> None:
+    """Recompute each widget's DEFAULT_CSS from the active palette."""
+    for location, build in CSS_BUILDERS.items():
+        globals()[location.split(".", 1)[0]].DEFAULT_CSS = build()
 

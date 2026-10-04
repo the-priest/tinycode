@@ -66,6 +66,27 @@ async def test_tui_full_turn(project, tmp_path):
         assert app.session.path.exists()
 
 
+async def test_theme_switch_is_live(project):
+    from tinycode.config import ui_state_path
+    from tinycode.tui import theme as T
+
+    cfg = Config(host="127.0.0.1:9", manage_server=False, theme="nord")
+    app = TinyCodeApp(cfg, project)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause(0.3)
+        assert T.active() == "nord"
+        nord_bg = app.screen.styles.background
+        await app.apply_theme("catppuccin-mocha")
+        await pilot.pause(0.2)
+        assert T.active() == "catppuccin-mocha"
+        assert app.screen.styles.background != nord_bg
+        assert ui_state_path().read_text().strip() == 'theme = "catppuccin-mocha"'
+        # unknown themes are rejected without disturbing the active one
+        await app._command("/theme banana")
+        await pilot.pause(0.1)
+        assert T.active() == "catppuccin-mocha"
+
+
 async def test_tui_boot_failure_is_reported(project):
     cfg = Config(host="127.0.0.1:9", manage_server=False)
     app = TinyCodeApp(cfg, project)

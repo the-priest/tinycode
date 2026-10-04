@@ -41,6 +41,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--yolo", action="store_true", help="same as --mode yolo")
     ap.add_argument("--no-sandbox", action="store_true",
                     help="allow tools to reach outside the project directory")
+    ap.add_argument("--theme", metavar="NAME",
+                    help="colour palette (run /theme inside the app to browse)")
     ap.add_argument("--think", dest="think", action="store_true", default=None,
                     help="enable model reasoning")
     ap.add_argument("--no-think", dest="think", action="store_false",
@@ -65,6 +67,8 @@ def build_config(args: argparse.Namespace) -> Config:
         over["mode"] = args.mode
     if args.no_sandbox:
         over["sandbox"] = False
+    if args.theme:
+        over["theme"] = args.theme
     if args.think is not None:
         over["think"] = args.think
     if args.ctx:

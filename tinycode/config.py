@@ -54,6 +54,21 @@ def log_path() -> Path:
     return cache_dir() / "tinycode.log"
 
 
+def ui_state_path() -> Path:
+    """Small TOML file for things the app remembers (currently the theme)."""
+    return data_dir() / "ui.toml"
+
+
+def save_theme(name: str) -> Path:
+    """Remember the chosen palette so it survives a restart."""
+    path = ui_state_path()
+    try:
+        path.write_text(f'theme = "{name}"\n', encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - best effort
+        log(f"could not save theme: {exc}")
+    return path
+
+
 def log(msg: str) -> None:
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     try:
@@ -105,6 +120,7 @@ class Config:
     # ui
     show_thinking: bool = False
     sidebar: bool = True
+    theme: str = "tokyo-night"       # colour palette (run /theme to browse)
     # internal (not user facing)
     extra: dict = field(default_factory=dict)
 
@@ -176,6 +192,7 @@ def load_config(overrides: dict | None = None) -> Config:
                     log(f"bad config value for {k}: {v!r}")
 
     _migrate_config()
+    apply(_read_toml(ui_state_path()))   # remembered UI choices (theme, …)
     apply(_read_toml(CONFIG_PATH))
     env = {}
     if os.environ.get("OLLAMA_HOST"):
@@ -190,6 +207,8 @@ def load_config(overrides: dict | None = None) -> Config:
         cfg.mode = "ask"
     if cfg.tool_mode not in ("stream", "native"):
         cfg.tool_mode = "native"
+    from .tui.theme import set_theme as _set_theme
+    cfg.theme = _set_theme(cfg.theme)     # normalise aliases, drop unknown names
     cfg.num_ctx = max(2048, cfg.num_ctx)
     return cfg
 
@@ -225,6 +244,7 @@ DEFAULT_CONFIG_TOML = """# tinycode configuration
 [ui]
 # show_thinking = false
 # sidebar = true
+# theme = "tokyo-night"   # /theme browses all (catppuccin-mocha, nord, gruvbox-dark, dracula, …)
 """
 
 # The 2.0.0 template wrote every value out explicitly. If a user's file is

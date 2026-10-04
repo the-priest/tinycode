@@ -17,7 +17,7 @@ A fully local terminal coding agent (Python + Textual, talks to Ollama).
 - `tinycode/parsing.py` — tool-call normalization, text tool-call recovery, loop detection
 - `tinycode/context.py` — system prompt, project memory, context pruning, @mentions
 - `tinycode/ollama.py` — Ollama HTTP client and server/model lifecycle
-- `tinycode/tui/` — Textual app (`app.py`), widgets/modals (`widgets.py`), colours (`theme.py`)
+- `tinycode/tui/` — Textual app (`app.py`), widgets/modals (`widgets.py`), colour themes (`theme.py`)
 - `tinycode/cli.py` — argument parsing, headless `-p` mode, `doctor`
 - `tests/fake_ollama.py` — scripted fake Ollama server used by the tests
 

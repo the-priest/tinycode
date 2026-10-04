@@ -56,6 +56,7 @@ Then just ask:
 | `tinycode -p "…"` | headless: run the task, print the answer (scripts, CI, pipes) |
 | `tinycode --yolo` | auto-approve everything (or `--mode auto-edit`) |
 | `tinycode --no-sandbox` | let tools reach outside the project directory (off by default) |
+| `tinycode --theme NAME` | colour palette (run `/theme` in the app to browse) |
 | `tinycode --no-think` | turn off reasoning for faster replies |
 | `tinycode doctor` | check Python, Ollama, the model, tool support and RAM |
 | `tinycode update` | upgrade in place |
@@ -108,6 +109,7 @@ A file that is still being written in chunks is reported as "unfinished, keep go
 **Nice to use.**
 - Streaming markdown answers, collapsible reasoning, and live command output.
 - A sidebar with the plan, a context gauge, token speed, and the files changed (`+12 -3`).
+- 13 built-in themes borrowed from the terminal world — Tokyo Night, Catppuccin Mocha/Macchiato, Nord, Gruvbox, Dracula, One Dark, Kanagawa, Everforest, Solarized, Ayu Mirage and Material Ocean. Type `/theme` to preview and switch; the whole UI repaints instantly and the choice is remembered.
 - `@file` to attach files (with autocomplete), `!cmd` to run a shell command yourself, `/` for the command menu, message history with ↑/↓, and queued messages while the agent is working.
 - Sessions are saved automatically; resume one with `/resume` or `tinycode -c`.
 - Project memory: tinycode reads `TINYCODE.md` (or `AGENTS.md` / `CLAUDE.md`). Run `/init` to generate one for your project.
@@ -127,7 +129,8 @@ A file that is still being written in chunks is reported as "unfinished, keep go
 | `ctrl+b` | sidebar | `/diff` | files changed this session |
 | `ctrl+n` | new conversation | `/model` | switch model |
 | `ctrl+l` | clear screen | `/cost` | token usage |
-| `ctrl+c` ×2 / `ctrl+q` | quit | `/export` | save the conversation as markdown |
+| `ctrl+c` ×2 / `ctrl+q` | quit | `/theme` | switch colour palette |
+|  |  | `/export` | save the conversation as markdown |
 
 ## Tools the model can use
 
@@ -160,6 +163,11 @@ run_tests = true      # run the project's tests before finishing, when code chan
 manage_server = true
 stop_server_on_exit = true
 unload_on_exit = true
+
+[ui]
+show_thinking = false  # expand reasoning by default
+sidebar = true
+theme = "tokyo-night"  # /theme browses all (catppuccin-mocha, nord, gruvbox-dark, dracula, …)
 ```
 
 Every key can also be set with an environment variable, for example `TINYCODE_NUM_CTX=32768` or `TINYCODE_MODE=auto-edit`. `OLLAMA_HOST` is respected. Personal instructions for every project go in `~/.config/tinycode/TINYCODE.md`.
