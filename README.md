@@ -7,7 +7,7 @@
 
 **A fast, reliable, fully local coding agent for your terminal.**
 
-Talk to it in plain language. It reads your code, edits files, runs commands and tests, and checks its own work.
+Talk to it in plain language. It reads your code, edits files, runs commands and tests, and **proves its work runs** before it says it's done.
 It runs on your machine through [Ollama](https://ollama.com) with **Ling-3.0-tiny**, and nothing leaves your computer.
 
 </div>
@@ -28,7 +28,7 @@ The installer does everything and asks before anything that needs `sudo`:
 | ✓ tinycode | in its own virtualenv, with a `tinycode` command in `~/.local/bin` |
 | ✓ Ollama | official installer if missing. It also offers to switch Ollama from always-on to on-demand. |
 | ✓ the model | Ling-3.0-tiny, about 5.3 GB, downloaded once with a progress bar |
-| ✓ extras | ripgrep for fast search, an app-menu launcher, a default config, and a `doctor` self-check |
+| ✓ extras | Node.js to run and test the web apps it builds, ripgrep for fast search, an app-menu launcher, a default config, and a `doctor` self-check |
 
 Options: `-y` (no questions), `--no-model`, `--no-ollama`, `--model TAG`, `--uninstall [--purge]`.
 From a clone, run `./install.sh`.
@@ -60,6 +60,18 @@ Then just ask:
 | `tinycode update` | upgrade in place |
 
 ## What makes it good
+
+**It checks that the code actually works, not just that it looks right.** Small models write code that looks plausible and doesn't run. tinycode closes that gap with automatic checks that need no extra model time and feed exact errors back to the model:
+
+1. **After every edit:** a fast syntax and bug check on that file (table below).
+2. **Web apps get run.** Any HTML page the model builds or changes is loaded with its scripts in a small simulated browser. It needs only Node.js, with no browser or download. tinycode clicks every button, types into inputs, presses keys, runs the game loop, and reports:
+   - crashes with file and line, e.g. `clicking "=": TypeError … script.js line 42`, plus a hint like "getElementById('displayy') returned null"
+   - broken wiring: `onclick` calling a function that doesn't exist, ids the JavaScript looks up that the HTML doesn't have, `<script src>` files that are missing
+   - invalid output such as `NaN`, `undefined` or `[object Object]` appearing on the page
+   - wrong behaviour in common apps: a calculator really gets `2 + 3 =` and must show 5, and a todo app must show the item you add
+3. **Your tests get run.** If code changed and the project has tests (pytest, npm test, cargo test, go test…), they run before the model is allowed to finish, and failures go back to it.
+4. **The model can test its own work** with the `test_app` tool, writing its own scenario: click 7, ×, 6, = and expect the display to show 42.
+5. **Finish gate:** when the model says it's done, all of the above runs on what it changed. Anything broken goes back to it to fix, for a few rounds at most. Problems that were already there before its change are left out, so it isn't pushed into edits nobody asked for.
 
 **Catches its own bugs while it works.** Every time the model writes or edits a file, tinycode runs a fast local check on it and puts the result straight into the tool output, with the line number and the offending line, so the model fixes it in its next step:
 
@@ -117,7 +129,7 @@ A file that is still being written in chunks is reported as "unfinished, keep go
 
 ## Tools the model can use
 
-`read_file` · `edit_file` · `write_file` · `bash` · `check` · `glob` · `grep` · `list_dir` · `todowrite` · `fetch_url`
+`read_file` · `edit_file` · `write_file` · `bash` · `test_app` · `check` · `glob` · `grep` · `list_dir` · `todowrite` · `fetch_url`
 
 `glob`, `grep` and `list_dir` skip `.git`, `node_modules`, virtualenvs and build folders. `grep` uses ripgrep when it is installed.
 
@@ -138,6 +150,8 @@ tool_mode = "native"   # native: Ollama tool calling · stream: experimental liv
 mode = "ask"           # ask | auto-edit | yolo
 max_steps = 40
 auto_check = true     # check every edited file, and again before finishing
+app_check = true      # run changed web pages in a simulated browser before finishing
+run_tests = true      # run the project's tests before finishing, when code changed
 
 [ollama]
 manage_server = true

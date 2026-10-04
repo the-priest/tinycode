@@ -147,8 +147,8 @@ async def test_safe_command_needs_no_approval(project):
 
 async def test_silent_tool_call_generation_reports_progress(project):
     class UI(RecUI):
-        async def generating(self, seconds, est_tokens, started):
-            self.events.append(("generating", started, est_tokens))
+        async def generating(self, seconds, est_tokens, started, phase="writing", eta=0.0):
+            self.events.append(("generating", started, est_tokens, phase))
 
     replies = [{"thinking": "Let me build this. " * 3, "pause": 3.5, "chunk": 4, "native": True,
                 "tool_calls": [{"name": "write_file",
@@ -378,3 +378,119 @@ def test_check_tool(project):
     assert not r.ok and "invalid JSON" in r.output
     r = t.t_check("calc.py")
     assert r.ok and "no problems" in r.output
+
+
+
+async def test_silence_before_any_output_is_reported_as_reading(project):
+    class UI(RecUI):
+        async def generating(self, seconds, est_tokens, started, phase="writing", eta=0.0):
+            self.events.append(("generating", phase))
+
+    with FakeOllama([{"wait": 2.5, "content": "hi"}]) as fake:
+        ui = UI()
+        agent = make(project, fake, ui)
+        agent.prefill_rate = 10.0          # pretend a slow CPU: ~whole prompt takes a while
+        await agent.run("hello")
+    phases = [e[1] for e in ui.events if e[0] == "generating"]
+    assert phases and phases[0] == "reading"
+
+
+async def test_preexisting_problems_do_not_trigger_the_gate(project):
+    (project / "old.py").write_text("def broken(:\n    pass\n\nx = 1\n")
+    replies = [
+        {"tool_calls": [{"name": "edit_file", "arguments": {
+            "path": "old.py", "old_string": "x = 1", "new_string": "x = 2"}}]},
+        {"content": "changed x"},
+    ]
+    with FakeOllama(replies) as fake:
+        agent = make(project, fake, mode="yolo")
+        assert await agent.run("set x to 2") == "changed x"
+        assert len(fake.requests) == 2          # no gate round for the old bug
+    edit_result = [m["content"] for m in agent.messages if is_tool_result(m)][0]
+    assert "already in this file" in edit_result and "Fix them now" not in edit_result
+
+
+async def test_failed_check_allows_rereading(project):
+    replies = [
+        {"tool_calls": [{"name": "write_file", "arguments": {
+            "path": "b.py", "content": "def f(x):\n    return x +\n"}}]},
+        {"tool_calls": [{"name": "read_file", "arguments": {"path": "b.py"}}]},
+        {"content": "ok"}, {"content": "ok"}, {"content": "ok"}, {"content": "ok"},
+    ]
+    with FakeOllama(replies) as fake:
+        agent = make(project, fake, mode="yolo")
+        await agent.run("x")
+    read_result = [m["content"] for m in agent.messages if is_tool_result(m)][1]
+    assert "has not changed" not in read_result and "return x +" in read_result
+
+
+def test_undo_clears_problems(project):
+    from tinycode.tools import Tools
+    t = Tools(project, Config())
+    t.t_write_file("bad.py", "def f(:\n")
+    assert "bad.py" in t.problems
+    t.restore(t.take_checkpoint())
+    assert "bad.py" not in t.problems and not (project / "bad.py").exists()
+
+
+async def test_finish_gate_runs_the_app_and_catches_wrong_results(project, tmp_path):
+    import shutil as _sh
+    from pathlib import Path as _P
+    if not _sh.which("node"):
+        import pytest as _pt
+        _pt.skip("node not installed")
+    src = _P(__file__).parent / "apps" / "calc_ok"
+    html = (src / "index.html").read_text()
+    good_js = (src / "script.js").read_text()
+    bad_js = good_js.replace("case '+': result = prev + curr; break;",
+                             "case '+': result = previousOperand + currentOperand; break;")
+    replies = [
+        {"tool_calls": [{"name": "write_file", "arguments": {"path": "index.html", "content": html}}]},
+        {"tool_calls": [{"name": "write_file", "arguments": {"path": "style.css",
+                                                             "content": ".btn{}\n"}}]},
+        {"tool_calls": [{"name": "write_file", "arguments": {"path": "script.js", "content": bad_js}}]},
+        {"content": "The calculator is ready!"},
+        {"tool_calls": [{"name": "edit_file", "arguments": {
+            "path": "script.js",
+            "old_string": "case '+': result = previousOperand + currentOperand; break;",
+            "new_string": "case '+': result = prev + curr; break;"}}]},
+        {"content": "Fixed: + was joining strings instead of adding numbers."},
+    ]
+    with FakeOllama(replies) as fake:
+        ui = RecUI()
+        agent = make(project, fake, ui, mode="yolo")
+        answer = await agent.run("make a calculator")
+        gate = fake.requests[4]["messages"][-1]["content"]
+    assert 'shows "23"' in gate and "expected 5" in gate
+    assert answer.startswith("Fixed")
+    assert any(e[0] == "notice" and "app check" in e[1] and "no errors" in e[1] for e in ui.events)
+
+
+async def test_finish_gate_runs_project_tests_once(tmp_path):
+    import sys as _sys
+    proj = tmp_path / "pyproj"
+    (proj / "tests").mkdir(parents=True)
+    (proj / "pyproject.toml").write_text("[project]\nname='x'\n[tool.pytest.ini_options]\n")
+    (proj / "mathx.py").write_text("def add(a, b):\n    return a + b\n")
+    (proj / "tests" / "test_mathx.py").write_text(
+        "import sys, os\nsys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))\n"
+        "from mathx import add\n\ndef test_add():\n    assert add(2, 3) == 5\n")
+    replies = [
+        {"tool_calls": [{"name": "edit_file", "arguments": {
+            "path": "mathx.py", "old_string": "return a + b", "new_string": "return a - b"}}]},
+        {"content": "Done"},
+        {"tool_calls": [{"name": "edit_file", "arguments": {
+            "path": "mathx.py", "old_string": "return a - b", "new_string": "return a + b"}}]},
+        {"content": "Fixed the test failure."},
+    ]
+    with FakeOllama(replies) as fake:
+        ui = RecUI()
+        agent = make(proj, fake, ui, mode="yolo")
+        agent.tools.cfg.test_timeout = 120
+        import os as _os
+        _os.environ["PATH"] = _os.path.dirname(_sys.executable) + _os.pathsep + _os.environ["PATH"]
+        answer = await agent.run("change add")
+        gate = fake.requests[2]["messages"][-1]["content"]
+    assert "tests fail" in gate and "assert" in gate
+    assert answer == "Fixed the test failure."
+    assert any(e[0] == "notice" and "tests pass" in e[1] for e in ui.events), ui.events

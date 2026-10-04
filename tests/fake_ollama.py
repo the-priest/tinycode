@@ -104,6 +104,8 @@ class FakeOllama:
                         time.sleep(outer.delay)
                     return True
 
+                if reply.get("wait"):
+                    time.sleep(reply["wait"])    # prompt processing before any token
                 for key in ("thinking", "content"):
                     text = reply.get(key) or ""
                     for i in range(0, len(text), size):

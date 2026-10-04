@@ -37,6 +37,8 @@ NAME_ALIASES = {
     "curl": "fetch_url", "webfetch": "fetch_url",
     "lint": "check", "check_syntax": "check", "syntax_check": "check", "diagnostics": "check",
     "validate": "check", "check_file": "check", "verify": "check", "check_code": "check",
+    "test_page": "test_app", "run_app": "test_app", "test_web": "test_app", "test": "test_app",
+    "browser_test": "test_app", "preview": "test_app", "open_in_browser": "test_app",
 }
 
 ARG_ALIASES = {
@@ -446,6 +448,15 @@ def looks_repetitive(buf: str) -> bool:
 # while they are being generated (Ollama holds native tool calls back).
 
 TOOL_RESPONSE_TAG = "<tool_response"
+
+
+def is_user_turn(m: dict) -> bool:
+    """A real user request (not a tool result or a tinycode-injected note)."""
+    if m.get("role") != "user" or is_tool_result(m):
+        return False
+    c = str(m.get("content", ""))
+    return not c.startswith(("[automatic check]", "[system note]", "[I ran a shell command",
+                             "[The user reverted", "[Context note", "[Summary of our"))
 
 
 def is_tool_result(m: dict) -> bool:

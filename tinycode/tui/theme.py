@@ -20,7 +20,7 @@ TEAL = "#73daca"
 TOOL_LABELS = {
     "read_file": "Read", "write_file": "Write", "edit_file": "Edit", "bash": "Bash",
     "glob": "Glob", "grep": "Grep", "list_dir": "List", "todowrite": "Plan",
-    "fetch_url": "Fetch", "check": "Check",
+    "fetch_url": "Fetch", "check": "Check", "test_app": "Test app",
 }
 
 MODE_STYLE = {

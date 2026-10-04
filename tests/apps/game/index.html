@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html><head><title>fsociety tetris</title>
+<style>body{background:#000;color:#e00;font-family:monospace} canvas{border:1px solid #e00}</style></head>
+<body>
+<h1 class="glitch">hello, friend.</h1>
+<canvas id="board" width="300" height="600"></canvas>
+<div>Score: <span id="score">0</span></div>
+<button id="start">Start</button>
+<script>
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d');
+const COLS = 10, ROWS = 20, SIZE = 30;
+const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+const SHAPES = [[[1,1,1,1]], [[1,1],[1,1]], [[0,1,0],[1,1,1]]];
+let piece = null, score = 0, running = false, last = 0, dropEvery = 500, acc = 0;
+function newPiece() { const s = SHAPES[Math.floor(Math.random() * SHAPES.length)]; piece = { shape: s, x: 3, y: 0 }; }
+function collides(p, dx, dy) {
+  return p.shape.some((row, y) => row.some((v, x) => v && (p.y + y + dy >= ROWS || p.x + x + dx < 0 || p.x + x + dx >= COLS || grid[p.y + y + dy][p.x + x + dx])));
+}
+function merge() { piece.shape.forEach((row, y) => row.forEach((v, x) => { if (v) grid[piece.y + y][piece.x + x] = 1; })); }
+function clearLines() { for (let y = ROWS - 1; y >= 0; y--) if (grid[y].every(Boolean)) { grid.splice(y, 1); grid.unshift(Array(COLS).fill(0)); score += 100; y++; } document.getElementById('score').textContent = score; }
+function drop() { if (!collides(piece, 0, 1)) piece.y++; else { merge(); clearLines(); newPiece(); } }
+function draw() { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.fillStyle = '#e00';
+  grid.forEach((row, y) => row.forEach((v, x) => v && ctx.fillRect(x * SIZE, y * SIZE, SIZE - 1, SIZE - 1)));
+  piece.shape.forEach((row, y) => row.forEach((v, x) => v && ctx.fillRect((piece.x + x) * SIZE, (piece.y + y) * SIZE, SIZE - 1, SIZE - 1))); }
+function loop(t) { acc += t - last; last = t; if (acc > dropEvery) { drop(); acc = 0; } draw(); if (running) requestAnimationFrame(loop); }
+document.addEventListener('keydown', e => {
+  if (!piece) return;
+  if (e.key === 'ArrowLeft' && !collides(piece, -1, 0)) piece.x--;
+  if (e.key === 'ArrowRight' && !collides(piece, 1, 0)) piece.x++;
+  if (e.key === 'ArrowDown') drop();
+  if (e.key === 'ArrowUp') { const r = piece.shape[0].map((_, i) => piece.shape.map(row => row[i]).reverse()); const old = piece.shape; piece.shape = r; if (collides(piece, 0, 0)) piece.shape = old; }
+});
+document.getElementById('start').addEventListener('click', () => { running = true; newPiece(); requestAnimationFrame(loop); });
+</script>
+</body></html>

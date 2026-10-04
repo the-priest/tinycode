@@ -37,6 +37,9 @@ tinycode = "tinycode.cli:main"
 [tool.setuptools.packages.find]
 include = ["tinycode*"]
 
+[tool.setuptools.package-data]
+tinycode = ["assets/*.js"]
+
 [tool.setuptools.dynamic]
 version = { attr = "tinycode.__version__" }
 

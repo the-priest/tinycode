@@ -14,6 +14,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -24,7 +25,7 @@ from typing import Any, Callable, Optional
 
 from . import __version__
 from .config import Config
-from . import checks
+from . import checks, webcheck
 from .edits import EditError, apply_edit, diff_stats, unified_diff
 
 IGNORED_DIRS = {
@@ -52,20 +53,113 @@ SAFE_COMMANDS = {
 }
 SAFE_GIT = {"status", "diff", "log", "show", "branch", "remote", "rev-parse",
             "ls-files", "blame", "describe", "tag", "shortlog", "config"}
-DANGEROUS = [
-    (re.compile(r"\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(/|~|\$HOME|\*|\.\.?)(\s|/?$)"),
-     "recursive delete of a root/home/whole directory"),
-    (re.compile(r"\bmkfs(\.\w+)?\b"), "formats a filesystem"),
-    (re.compile(r"\bdd\s+.*\bof=/dev/"), "writes raw to a device"),
-    (re.compile(r":\(\)\s*\{\s*:\|:&\s*\};:"), "fork bomb"),
-    (re.compile(r"\b(shutdown|reboot|halt|poweroff)\b"), "powers off the machine"),
-    (re.compile(r"\bchmod\s+-R\s+0?777\s+/"), "opens permissions on the whole system"),
-    (re.compile(r"\bgit\s+push\b.*(--force|-f\b)"), "force-pushes git history"),
-    (re.compile(r"\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f)"), "discards local changes"),
-    (re.compile(r"(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z)?sh\b"), "pipes a download into a shell"),
-    (re.compile(r"\bsudo\b"), "runs as root"),
-    (re.compile(r">\s*/dev/sd[a-z]"), "overwrites a disk"),
-]
+# Commands that always need approval, even in yolo mode. Matched on the
+# *command words* of each pipeline segment (via a shell-like tokenizer), so
+# code inside quotes -- e.g. python -c "server.shutdown()" -- never matches.
+_ROOTISH = {"/", "/*", "~", "~/", "~/*", "$HOME", "$HOME/", "${HOME}", "*", ".", "..", "./*",
+            "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/opt", "/root", "/sbin",
+            "/srv", "/usr", "/var"}
+_WRAPPERS = {"sudo", "doas", "nohup", "time", "exec", "env", "nice", "command", "builtin",
+             "xargs", "stdbuf", "timeout"}
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+
+
+def _segments(cmd: str) -> list[list[str]]:
+    """Split a shell command into pipeline segments of words (quotes respected).
+    Returns [] when it can't be tokenized (unbalanced quotes)."""
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")
+    lex.whitespace_split = True
+    lex.commenters = ""
+    segs: list[list[str]] = [[]]
+    try:
+        for tok in lex:
+            if tok and set(tok) <= set(";&|()\n"):
+                segs.append([tok])          # keep the operator as its own marker
+                segs.append([])
+            else:
+                segs[-1].append(tok)
+    except ValueError:
+        return []
+    return [s for s in segs if s]
+
+
+def _command_words(words: list[str]) -> list[str]:
+    """Strip leading VAR=x assignments and wrappers like sudo/nohup/env."""
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w):
+            i += 1
+        elif os.path.basename(w) in _WRAPPERS:
+            i += 1
+            while i < len(words) and words[i].startswith("-"):   # e.g. sudo -u x
+                i += 2 if words[i] in ("-u", "-g", "-n") else 1
+        else:
+            break
+    return words[i:]
+
+
+def danger_reason(cmd: str) -> str:
+    """Why a shell command is dangerous, or '' if it isn't."""
+    if re.search(r":\(\)\s*\{\s*:\|:&\s*\};\s*:", cmd):
+        return "is a fork bomb"
+    segs = _segments(cmd)
+    if not segs:
+        segs = [cmd.split()]
+    for seg in segs:
+        first = next((w for w in seg if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)), "")
+        if os.path.basename(first) in ("sudo", "doas", "pkexec"):
+            return "runs as root (sudo)"
+    prev_op = ""
+    prev_cmd = ""
+    for seg in segs:
+        if len(seg) == 1 and set(seg[0]) <= set(";&|()\n"):
+            prev_op = seg[0]
+            continue
+        words = _command_words(seg)
+        if not words:
+            continue
+        exe = os.path.basename(words[0])
+        args = words[1:]
+        flags = "".join(a[1:] for a in args if a.startswith("-") and not a.startswith("--"))
+        if exe in ("shutdown", "reboot", "halt", "poweroff"):
+            return "powers off or restarts the machine"
+        if exe == "systemctl" and any(a in ("poweroff", "reboot", "halt", "suspend",
+                                            "hibernate", "kexec") for a in args):
+            return "powers off or restarts the machine"
+        if exe in ("init", "telinit") and any(a in ("0", "6") for a in args):
+            return "powers off or restarts the machine"
+        if exe == "rm" and ("r" in flags.lower() or "--recursive" in args) and \
+                any(a.rstrip("/") in {r.rstrip("/") for r in _ROOTISH} or a in _ROOTISH
+                    for a in args if not a.startswith("-")):
+            return "deletes a whole system, home or project directory"
+        if exe.startswith("mkfs") or exe in ("wipefs", "fdisk", "parted", "sfdisk"):
+            return "formats or repartitions a disk"
+        if exe == "dd" and any(a.startswith("of=/dev/") for a in args):
+            return "writes raw data to a device"
+        if exe in ("chmod", "chown") and ("R" in flags or "--recursive" in args) and \
+                any(a in ("/", "/*") for a in args):
+            return "changes permissions on the whole system"
+        if exe == "git" and args:
+            sub = next((a for a in args if not a.startswith("-")), "")
+            if sub == "push" and any(a in ("--force", "-f", "--force-with-lease") or
+                                     (a.startswith("-") and not a.startswith("--") and "f" in a)
+                                     for a in args):
+                return "force-pushes git history"
+            if sub == "reset" and "--hard" in args:
+                return "discards local changes (git reset --hard)"
+            if sub == "clean" and "f" in flags:
+                return "deletes untracked files (git clean)"
+        if exe in _SHELLS and prev_op == "|" and prev_cmd in ("curl", "wget"):
+            return "pipes a download straight into a shell"
+        prev_cmd = exe
+        prev_op = ""
+    for seg in segs:                         # > /dev/sdX redirections
+        for i, w in enumerate(seg[:-1]):
+            if w in (">", ">>", "1>", "2>") and \
+                    re.match(r"/dev/(sd|nvme|hd|vd|mmcblk|disk)", seg[i + 1]):
+                return "overwrites a disk"
+    return ""
 
 
 @dataclass
@@ -161,6 +255,16 @@ TOOL_SCHEMAS: list[dict] = [
     _schema("fetch_url",
             "Fetch a web page or API URL and return its text.",
             {"url": {"type": "string"}}, ["url"]),
+    _schema("test_app",
+            "Run a web page (HTML/JS) in a simulated browser: loads it, clicks every button, "
+            "presses keys and reports crashes, broken wiring and wrong results. Optional steps "
+            "test the main feature, e.g. [{\"click\": \"5\"}, {\"click\": \"+\"}, "
+            "{\"click\": \"2\"}, {\"click\": \"=\"}, {\"expect\": [\"#display\", \"7\"]}]. "
+            "Step kinds: click (button text or CSS selector), type [selector, text], key, "
+            "wait (ms), expect [selector, text].",
+            {"path": {"type": "string", "description": "the .html file (optional)"},
+             "steps": {"type": "array", "items": {"type": "object"},
+                       "description": "optional scenario to check behaviour"}}, []),
     _schema("check",
             "Check code for syntax errors and obvious bugs (undefined names, unclosed "
             "tags/braces, invalid JSON…). Give a file or folder, or nothing to check every "
@@ -185,6 +289,8 @@ class Tools:
         self.checkpoint: dict[str, Optional[bytes]] = {}
         self.changed: dict[str, list[int]] = {}   # path -> [added, removed]
         self.problems: dict[str, "checks.CheckResult"] = {}  # rel path -> latest failed check
+        self.checks_run = 0
+        self._base_cache: dict[str, Optional[set]] = {}
         self.cancel = threading.Event()
         self.on_output: Callable[[str], None] | None = None  # live bash output
         self._rg = shutil.which("rg")
@@ -240,9 +346,9 @@ class Tools:
             return mode == "ask", ""
         if name in SHELL_TOOLS:
             cmd = str(args.get("command", ""))
-            for rx, why in DANGEROUS:
-                if rx.search(cmd):
-                    return True, f"⚠ this command {why}"
+            why = danger_reason(cmd)
+            if why:
+                return True, f"⚠ this command {why}"
             if is_safe_command(cmd):
                 return False, ""
             return mode != "yolo", ""
@@ -308,7 +414,7 @@ class Tools:
         st = p.stat()
         text = p.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
-        if offset == 1 and limit >= len(lines) and \
+        if offset == 1 and limit >= len(lines) and self.rel(p) not in self.problems and \
                 self.seen.get(str(p)) == (st.st_mtime_ns, st.st_size):
             return ToolResult(
                 f"{self.rel(p)} has not changed since you last read or wrote it "
@@ -325,9 +431,13 @@ class Tools:
         if offset > 1 or end < len(lines):
             header += f" (showing {offset}-{end}; use offset to read more)"
         self.read_files.add(str(p))
-        if offset == 1 and end >= len(lines):
+        full = f"{header}\n{body}"
+        out = _truncate(full, self._limit())
+        clipped = out != full or any(len(l) > 500 for l in chunk)
+        if offset == 1 and end >= len(lines) and not clipped:
             self.seen[str(p)] = (st.st_mtime_ns, st.st_size)
-        out = _truncate(f"{header}\n{body}", self._limit())
+        else:
+            self.seen.pop(str(p), None)
         return ToolResult(out, summary=f"read {len(chunk)} lines", detail=body)
 
     def t_write_file(self, path: str, content: str = "", append: bool = False) -> ToolResult:
@@ -380,16 +490,83 @@ class Tools:
             summary=f"+{add} -{rem}{note}", diff=diff))
 
     # ------------------------------------------------------------- checks
+    @staticmethod
+    def _checkable(p: Path, text: Optional[str] = None) -> bool:
+        if checks.supported(p):
+            return True
+        if p.suffix == "":
+            if text is None:
+                try:
+                    with open(p, "rb") as fh:
+                        text = fh.read(64).decode("utf-8", "replace")
+                except OSError:
+                    return False
+            return text.startswith("#!") and "sh" in text.split("\n", 1)[0]
+        return False
+
+    @staticmethod
+    def _keys(res: "checks.CheckResult", text: str) -> set:
+        lines = text.split("\n")
+        keys = set()
+        for pr in res.problems:
+            src = lines[pr.line - 1].strip() if 1 <= pr.line <= len(lines) else ""
+            keys.add((pr.message, src))
+        return keys
+
+    def _baseline(self, p: Path) -> Optional[set]:
+        """Problem keys the file already had before this turn (None = new file)."""
+        key = str(p)
+        if key in self._base_cache:
+            return self._base_cache[key]
+        orig = self.checkpoint.get(key)
+        keys: Optional[set] = None
+        if orig is not None:
+            text = orig.decode("utf-8", "replace")
+            tmpdir = tempfile.mkdtemp(prefix="tinycode-base-")
+            try:
+                tp = Path(tmpdir) / p.name
+                tp.write_text(text, encoding="utf-8")
+                keys = self._keys(checks.check_file(tp, text), text)
+            except OSError:
+                keys = set()
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        self._base_cache[key] = keys
+        return keys
+
+    def _check_new(self, p: Path, text: str) -> tuple["checks.CheckResult", int]:
+        """Check a changed file, hiding problems that were already there before
+        this turn (the model shouldn't be pushed to fix code it didn't break)."""
+        res = checks.check_file(p, text)
+        base = self._baseline(p) if res.problems else None
+        hidden = 0
+        if base:
+            lines = text.split("\n")
+            keep = []
+            for pr in res.problems:
+                src = lines[pr.line - 1].strip() if 1 <= pr.line <= len(lines) else ""
+                if (pr.message, src) in base:
+                    hidden += 1
+                else:
+                    keep.append(pr)
+            res.problems = keep
+        self._note_check(p, res)
+        return res, hidden
+
     def _with_check(self, p: Path, text: str, result: ToolResult) -> ToolResult:
         """Run the fast syntax/error check on a file the model just changed and
         put the findings in the tool result, so it can fix them right away."""
-        if not self.cfg.auto_check or not checks.supported(p):
+        if not self.cfg.auto_check or not self._checkable(p, text):
             return result
-        res = checks.check_file(p, text)
-        self._note_check(p, res)
+        res, hidden = self._check_new(p, text)
+        if res.errors or res.incomplete:
+            self.seen.pop(str(p), None)      # it will need to look at the file again
         if not res.checked:
             return result
         result.output += checks.for_model(res, text, self.rel(p))
+        if hidden:
+            result.output += (f"\n({hidden} problem(s) that were already in this file before "
+                              "your change are not shown.)")
         label = checks.summary(res)
         if label:
             result.summary = f"{result.summary} · {label}" if result.summary else label
@@ -398,6 +575,7 @@ class Tools:
 
     def _note_check(self, p: Path, res: "checks.CheckResult") -> None:
         key = self.rel(p)
+        self.checks_run += 1
         if res.checked and (res.errors or res.incomplete):
             self.problems[key] = res
         else:
@@ -406,10 +584,128 @@ class Tools:
     def check_paths(self, paths: list[Path]) -> list["checks.CheckResult"]:
         out = []
         for p in paths:
-            if p.is_file() and checks.supported(p):
+            if self.cancel.is_set():
+                break
+            if not p.exists():
+                self.problems.pop(self.rel(p), None)
+                continue
+            if p.is_file() and self._checkable(p):
                 res = checks.check_file(p)
                 self._note_check(p, res)
                 out.append(res)
+        return out
+
+    def check_turn(self) -> list[tuple[Path, "checks.CheckResult", str]]:
+        """Re-check every file changed this turn (baseline-filtered)."""
+        out = []
+        for key in list(self.checkpoint):
+            if self.cancel.is_set():
+                break
+            p = Path(key)
+            if not p.is_file():
+                self.problems.pop(self.rel(p), None)
+                continue
+            if not self._checkable(p):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            res, _hidden = self._check_new(p, text)
+            out.append((p, res, text))
+        return out
+
+    # ------------------------------------------------------------ app check
+    def app_report_result(self, reports: list["webcheck.AppReport"], final: bool = False,
+                          ) -> ToolResult:
+        parts = []
+        for r in reports:
+            parts.append(webcheck.for_model(r, self.rel(self.workdir / r.page)
+                                            if not os.path.isabs(r.page) else r.page,
+                                            final).strip())
+        text = "\n\n".join(parts) or "no web page to test"
+        bad = [r for r in reports if not r.ok and not (r.skipped and not r.errors)]
+        nprob = sum(len(r.errors) + sum(1 for e in r.expects if not e.get("ok")) for r in bad)
+        if bad:
+            summary = f"✗ {nprob} problem(s)"
+        elif any(r.ran for r in reports):
+            probes = sum(len(r.probes) for r in reports)
+            clicks = sum(r.clicks for r in reports)
+            summary = f"✓ app works · {clicks} clicks" + (f" · {probes} checks" if probes else "")
+            if any(r.expects for r in reports):
+                summary += f" · {sum(len(r.expects) for r in reports)} expectations met"
+        else:
+            summary = reports[0].skipped if reports else "nothing to test"
+        return ToolResult(_truncate(text, self._limit()), ok=not bad, summary=summary,
+                          detail=text, meta={"app": reports})
+
+    def t_test_app(self, path: str = "", steps: Any = None) -> ToolResult:
+        if isinstance(steps, str):
+            from .parsing import loads_lenient
+            steps = loads_lenient(steps)
+        if steps is not None and not isinstance(steps, list):
+            steps = [steps] if isinstance(steps, dict) else None
+        if path:
+            p = self.resolve(path)
+            if p.is_dir():
+                p = p / "index.html"
+            if not p.is_file():
+                return ToolResult(f"ERROR: no such page: {self.rel(p)}", ok=False,
+                                  summary="no such page")
+            pages = [p] if p.suffix.lower() in (".html", ".htm") else \
+                webcheck.pages_for([p], self.workdir)
+        else:
+            changed = [self.resolve(k) for k in self.changed]
+            pages = webcheck.pages_for(changed, self.workdir) or \
+                [p for p in (self.workdir / "index.html",) if p.is_file()] or \
+                sorted(self.workdir.glob("*.htm*"))[:1]
+        if not pages:
+            return ToolResult("ERROR: no HTML page found to test. Give the path of the .html file.",
+                              ok=False, summary="no page")
+        reports = []
+        for p in pages:
+            r = webcheck.run_page(p, steps=steps or None)
+            r.page = self.rel(p)
+            reports.append(r)
+        return self.app_report_result(reports)
+
+    CODE_EXT = {".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
+                ".kt", ".rb", ".php", ".c", ".cc", ".cpp", ".h", ".hpp"}
+
+    def test_turn(self) -> Optional[tuple[str, int, str]]:
+        """Run the project's test command if code changed this turn.
+        Returns (command, exit_code, output_tail) or None if not applicable."""
+        if not self.cfg.run_tests or self.cancel.is_set():
+            return None
+        if not any(Path(k).suffix.lower() in self.CODE_EXT for k in self.checkpoint):
+            return None
+        from .context import project_info
+        _kinds, cmd = project_info(self.workdir)
+        if not cmd:
+            return None
+        if cmd.startswith("python -m pytest") and not any(
+                self.workdir.glob(pat) for pat in ("test_*.py", "*_test.py", "tests/**/*.py",
+                                                    "test/**/*.py")):
+            return None
+        res = self.t_bash(cmd, timeout=self.cfg.test_timeout)
+        code = res.meta.get("exit", 1 if not res.ok else 0)
+        if "timed out" in res.summary:
+            return None                     # don't block finishing on a slow suite
+        tail = "\n".join((res.detail or res.output).splitlines()[-60:])
+        return cmd, int(code), tail
+
+    def app_check_turn(self) -> list["webcheck.AppReport"]:
+        """Run every web page affected by this turn's changes (finish gate)."""
+        if not self.cfg.app_check:
+            return []
+        changed = [Path(k) for k in self.checkpoint if Path(k).exists()]
+        out = []
+        for p in webcheck.pages_for(changed, self.workdir):
+            if self.cancel.is_set():
+                break
+            r = webcheck.run_page(p)
+            r.page = self.rel(p)
+            out.append(r)
         return out
 
     def t_check(self, path: str = "") -> ToolResult:
@@ -423,12 +719,14 @@ class Tools:
                 targets = [base]
             else:
                 targets = [Path(r) / f for r, _d, fs in self._walk(base) for f in fs
-                           if checks.supported(Path(f))][:300]
+                           if checks.supported(Path(f))][:200]
         else:
-            targets = [self.resolve(k) for k in self.changed] or \
+            targets = [p for p in (self.resolve(k) for k in self.changed) if p.exists()] or \
                 [Path(r) / f for r, _d, fs in self._walk(self.workdir) for f in fs
-                 if checks.supported(Path(f))][:300]
+                 if checks.supported(Path(f))][:200]
         results = [r for r in self.check_paths(targets) if r.checked]
+        if self.cancel.is_set():
+            return ToolResult("check interrupted by the user", ok=False, summary="interrupted")
         if not results:
             return ToolResult("nothing to check (no supported files found, or the checkers "
                               "for these file types are not installed)", summary="nothing to check")
@@ -445,9 +743,9 @@ class Tools:
             return ToolResult(f"✓ {len(results)} file(s) checked, no problems found.",
                               summary=f"✓ {len(results)} file(s) clean")
         n = sum(len(r.errors) + (1 if r.incomplete else 0) for r in bad)
-        return ToolResult("\n\n".join(lines), ok=False,
-                          summary=f"✗ {n} problem(s) in {len(bad)} file(s)",
-                          detail="\n\n".join(lines))
+        text = "\n\n".join(lines)
+        return ToolResult(_truncate(text, self._limit()), ok=False,
+                          summary=f"✗ {n} problem(s) in {len(bad)} file(s)", detail=text)
 
     def _walk(self, base: Path):
         for root, dirs, files in os.walk(base):
@@ -606,7 +904,10 @@ class Tools:
         env = dict(os.environ)
         env.update({"PAGER": "cat", "GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0",
                     "TERM": "dumb", "NO_COLOR": "1", "PYTHONUNBUFFERED": "1",
-                    "TINYCODE": "1", "DEBIAN_FRONTEND": "noninteractive"})
+                    "TINYCODE": "1", "DEBIAN_FRONTEND": "noninteractive",
+                    # fast successive edits can leave a same-size .pyc with the same
+                    # mtime second, so Python would run stale code: never write them
+                    "PYTHONDONTWRITEBYTECODE": "1"})
         shell = "/bin/bash" if os.path.exists("/bin/bash") else None
         start = time.monotonic()
         try:
@@ -727,6 +1028,7 @@ class Tools:
     # ---------------------------------------------------------------- undo
     def take_checkpoint(self) -> dict[str, Optional[bytes]]:
         cp, self.checkpoint = self.checkpoint, {}
+        self._base_cache = {}
         return cp
 
     def restore(self, cp: dict[str, Optional[bytes]]) -> list[str]:
@@ -742,8 +1044,12 @@ class Tools:
                     p.write_bytes(data)
                 restored.append(self.rel(p))
                 self.changed.pop(self.rel(p), None)
+                self.problems.pop(self.rel(p), None)
+                self.seen.pop(str(p), None)
             except OSError:
                 pass
+        if self.cfg.auto_check:
+            self.check_paths([Path(k) for k in cp if Path(k).exists()])
         return restored
 
 

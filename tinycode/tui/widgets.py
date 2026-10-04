@@ -103,6 +103,11 @@ def tool_target(name: str, args: dict) -> str:
         return f"{len(args.get('todos') or [])} items"
     if name == "fetch_url":
         return str(args.get("url", ""))
+    if name == "check":
+        return _rel(args.get("path", "")) or "changed files"
+    if name == "test_app":
+        n = len(args.get("steps") or [])
+        return (_rel(args.get("path", "")) or "web page") + (f", {n} steps" if n else "")
     return ", ".join(f"{k}={v!r}" for k, v in args.items())[:100]
 
 
@@ -472,7 +477,7 @@ class ToolCallView(Vertical):
                 note.append("  … unfinished so far: " + "; ".join(chk.incomplete)[:160] + "\n",
                             style=T.YELLOW)
             note.rstrip()
-            body = note if body is None else Group(body, note)
+            body = note if body is None else Group(note, body)
         if body is None:
             self.body.display = False
         else:

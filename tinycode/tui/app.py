@@ -27,7 +27,7 @@ from ..agent import Agent, AgentUI, Decision
 from ..config import Config, log, log_path, write_default_config
 from ..context import expand_mentions, git_branch
 from ..ollama import Ollama, OllamaError
-from ..parsing import extract_text_tool_calls, is_tool_result
+from ..parsing import extract_text_tool_calls, is_tool_result, is_user_turn
 from ..session import Session, ago, list_sessions
 from ..tools import IGNORED_DIRS, ToolResult
 from . import theme as T
@@ -232,9 +232,11 @@ class Bridge(AgentUI):
             return Decision(True, always=True)
         return Decision(choice == "yes", feedback=feedback or "")
 
-    async def generating(self, seconds: float, est_tokens: int, started: bool) -> None:
-        if not started:
-            self.app.set_activity("Reading", "processing the conversation…")
+    async def generating(self, seconds: float, est_tokens: int, started: bool,
+                         phase: str = "writing", eta: float = 0.0) -> None:
+        if phase == "reading":
+            left = f" · ~{eta:.0f}s left" if eta >= 1 else ""
+            self.app.set_activity("Reading", f"the model is processing the conversation{left}")
             return
         if self.think_box is not None and self.think_box.title.startswith("∴ Thinking"):
             self.think_box.title = "∴ Thought"
@@ -341,6 +343,7 @@ class TinyCodeApp(App):
         if resume:
             self.agent.load_messages(resume.messages)
             self.agent.tools.todos = list(resume.todos or [])
+            self.agent.tools.todos_auto = bool(getattr(resume, "todos_auto", False))
             self.agent.tokens_in = resume.tokens_in
             self.agent.tokens_out = resume.tokens_out
         self.initial_prompt = initial_prompt
@@ -608,8 +611,11 @@ class TinyCodeApp(App):
         probs = a.tools.problems
         pr.append("PROBLEMS\n", style=f"bold {T.BLUE}")
         if not probs:
-            pr.append("✓ none" if a.tools.changed else "none yet",
-                      style=T.GREEN if a.tools.changed else T.DIM)
+            ran = a.tools.checks_run > 0
+            pr.append("✓ none" if ran else "nothing checked yet",
+                      style=T.GREEN if ran else T.DIM)
+        if len(probs) > 8:
+            pr.append(f"… {len(probs) - 8} more files\n", style=T.MUTED)
         for path, res in list(probs.items())[-8:]:
             n = len(res.errors)
             pr.append(short(path, 22).ljust(23), style=T.TEXT_SOFT)
@@ -652,6 +658,8 @@ class TinyCodeApp(App):
                     body = content.split("\n", 1)[-1].rsplit("</tool_response>", 1)[0].strip()
                     v.finish(ToolResult(body, ok=not body.startswith("ERROR"),
                                         summary=short(body.split("\n")[0], 100)), 0)
+            elif role == "user" and not is_user_turn(m):
+                await self.bridge.notice(short(content.split("\n")[0], 140), "dim")
             elif role == "user":
                 await self.emit_user(content[:2000])
             elif role == "assistant" and "<tool_call>" in content:
@@ -856,6 +864,7 @@ class TinyCodeApp(App):
                 await self.bridge.notice(f"✻ done in {el:.0f}s", "dim")
             self.session.messages = self.agent.messages
             self.session.todos = self.agent.tools.todos
+            self.session.todos_auto = self.agent.tools.todos_auto
             self.session.tokens_in = self.agent.tokens_in
             self.session.tokens_out = self.agent.tokens_out
             await asyncio.to_thread(self.session.save)
@@ -1246,6 +1255,7 @@ class TinyCodeApp(App):
         self.agent.reset()
         self.agent.load_messages(s.messages)
         self.agent.tools.todos = list(s.todos or [])
+        self.agent.tools.todos_auto = bool(getattr(s, "todos_auto", False))
         await self.log_view.remove_children()
         await self.replay(s.messages)
         self.refresh_side()

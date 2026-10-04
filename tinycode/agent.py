@@ -54,7 +54,8 @@ class AgentUI:
     async def tool_draft(self, name: str, args: dict) -> None:
         """A tool call is being written (stream mode): partial name/args so far."""
 
-    async def generating(self, seconds: float, est_tokens: int, started: bool) -> None:
+    async def generating(self, seconds: float, est_tokens: int, started: bool,
+                         phase: str = "writing", eta: float = 0.0) -> None:
         """Nothing has streamed for a while. Either the model is still reading
         its context (started=False), or it is producing output we can't see
         yet: Ollama holds back a tool call until it is complete (e.g. a whole
@@ -86,6 +87,9 @@ class Agent:
         self.always: set[str] = set()
         self.undo_stack: list[dict] = []
         self._step_note = ""
+        self.last_app_reports: list = []
+        self.last_tests: Optional[tuple] = None
+        self._tests_reported = False
         self.busy = False
         self._cancel = False
         self._stream: Optional[ChatStream] = None
@@ -96,6 +100,8 @@ class Agent:
         self.calib = 1.0
         self.turn_started = 0.0
         self.rate = 10.0          # measured output speed, tokens/s
+        self.prefill_rate = 150.0  # measured prompt-processing speed, tokens/s
+        self._cached_est = 0       # tokens Ollama should already have cached
         self.stream_tools = cfg.tool_mode == "stream"
 
     # ----------------------------------------------------------- utilities
@@ -137,7 +143,8 @@ class Agent:
         self.tools.cancel.clear()
         self.turn_started = time.monotonic()
         self.messages.append({"role": "user", "content": user_text})
-        if self.tools.todos_auto or not self.tools.todos:
+        if self.tools.todos_auto or not self.tools.todos or \
+                all(t.get("status") == "completed" for t in self.tools.todos):
             self.tools.todos = []
             self.tools.todos_auto = True
         self._step_note = ""
@@ -146,6 +153,9 @@ class Agent:
         retries = 0
         last_abort = ""
         gate_rounds = 0
+        self._tests_reported = False
+        self.last_tests = None
+        self.last_app_reports = []
         step = 0
         try:
             while step < self.cfg.max_steps:
@@ -264,6 +274,9 @@ class Agent:
                 if self.cfg.auto_check and gate_rounds < self.cfg.check_rounds \
                         and not self._cancel:
                     report, nbad = await asyncio.to_thread(self._final_check)
+                    if self._cancel:
+                        final_text = text
+                        break
                     if report:
                         gate_rounds += 1
                         await self.ui.notice(
@@ -272,10 +285,23 @@ class Agent:
                         self.messages.append({"role": "user", "content":
                             "[automatic check] You are not done yet. These files you changed "
                             "still have errors:\n\n" + report +
-                            "\n\nFix every problem with edit_file (or write_file for an "
-                            "unfinished file), then give your final summary."})
+                            "\n\nFix every problem with edit_file (for an unfinished file, add "
+                            "the missing rest with write_file and append=true), then give your "
+                            "final summary."})
                         continue
-                    if gate_rounds:
+                    apps = [r for r in self.last_app_reports if r.ran]
+                    if self.last_tests and self.last_tests[1] == 0:
+                        await self.ui.notice(f"✓ tests pass ({self.last_tests[0]})", "ok")
+                    elif self.last_tests:
+                        await self.ui.notice(f"✗ tests still fail ({self.last_tests[0]})", "warn")
+                    if apps:
+                        probes = sum(len(r.probes) for r in apps)
+                        await self.ui.notice(
+                            "✓ app check: " + ", ".join(r.page for r in apps) + " ran in a "
+                            f"simulated browser — {sum(r.clicks for r in apps)} clicks"
+                            + (f", {probes} behaviour checks passed" if probes else "")
+                            + ", no errors", "ok")
+                    elif gate_rounds:
                         await self.ui.notice("✓ automatic check: all changed files pass", "ok")
                 final_text = text
                 break
@@ -319,6 +345,9 @@ class Agent:
         if nudge:
             messages = messages + [{"role": "user", "content": f"[system note] {nudge}"}]
         est = estimate_tokens(messages)
+        # how long Ollama will likely spend reading the new part of the prompt
+        new_tokens = max(64, est - self._cached_est) if self._cached_est else est
+        prefill_s = new_tokens / max(self.prefill_rate, 1.0)
 
         def producer() -> None:
             try:
@@ -361,8 +390,14 @@ class Agent:
             except asyncio.TimeoutError:
                 idle = time.monotonic() - last_chunk
                 if idle >= 2.0 and not self._cancel:
-                    # silent generation (tool-call arguments): estimate progress
-                    await self.ui.generating(idle, int(idle * self.rate), visible_tokens > 0)
+                    if visible_tokens == 0 and idle < prefill_s * 1.3 + 3:
+                        await self.ui.generating(idle, 0, False, "reading",
+                                                 max(0.0, prefill_s - idle))
+                    else:
+                        # silent generation (Ollama holds tool-call arguments back)
+                        writing = idle if visible_tokens else max(0.0, idle - prefill_s)
+                        await self.ui.generating(idle, int(writing * self.rate),
+                                                 visible_tokens > 0, "writing")
                 continue
             if chunk is DONE:
                 break
@@ -461,6 +496,10 @@ class Agent:
             pin, pout = f.get("prompt_eval_count") or 0, f.get("eval_count") or 0
             self.tokens_in += pin
             self.tokens_out += pout
+            pdur = (f.get("prompt_eval_duration") or 0) / 1e9
+            if pin > 32 and pdur > 0.2:
+                self.prefill_rate = 0.5 * self.prefill_rate + 0.5 * (pin / pdur)
+            self._cached_est = est + pout
             if pin:
                 self.last_prompt_tokens = pin + pout
                 if est > 200 and pin > 200:
@@ -534,20 +573,27 @@ class Agent:
         await self._finish_call(call_id, name, args, result, t0)
 
     def _final_check(self) -> tuple[str, int]:
-        """Re-check every file changed this turn. Returns (report, files_with_problems)."""
-        from . import checks
-        paths = [Path(p) for p in self.tools.checkpoint]
-        results = self.tools.check_paths(paths)
+        """Re-check every file changed this turn (ignoring problems that were
+        already there before), then run any web page it touched.
+        Returns (report, number_of_files_or_pages_with_problems)."""
+        from . import checks, webcheck
         parts = []
-        for r in results:
+        for p, r, text in self.tools.check_turn():
             if not r.checked or not (r.errors or r.incomplete):
                 continue
-            p = Path(r.path)
-            try:
-                text = p.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                text = ""
             parts.append(checks.for_model(r, text, self.tools.rel(p), final=True).strip())
+        if not parts and not self._cancel:          # only run pages that parse
+            self.last_app_reports = self.tools.app_check_turn()
+            for rep in self.last_app_reports:
+                if not rep.ok and rep.errors:
+                    parts.append(webcheck.for_model(rep, rep.page, final=True).strip())
+        if not parts and not self._cancel:
+            self.last_tests = self.tools.test_turn()
+            if self.last_tests and self.last_tests[1] != 0 and not self._tests_reported:
+                self._tests_reported = True        # send test failures back once per turn
+                cmd, code, tail = self.last_tests
+                parts.append(f"✗ The project's tests fail (`{cmd}` exited with {code}):\n{tail}\n"
+                             "Fix the code (or the tests, if they are wrong), then finish.")
         return "\n\n".join(parts), len(parts)
 
     async def _log_step(self, name: str, args: dict) -> None:

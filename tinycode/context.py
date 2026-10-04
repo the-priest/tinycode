@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .parsing import is_tool_result
+from .parsing import is_tool_result, is_user_turn
 from .tools import IGNORED_DIRS, TOOL_SCHEMAS
 
 MEMORY_FILES = ("TINYCODE.md", "AGENTS.md", "CLAUDE.md", ".tinycode/instructions.md")
@@ -33,6 +33,8 @@ SYSTEM_PROMPT = """You are tinycode, an expert software engineer working as a co
 - Before each tool call, say in one short sentence what you are about to do.
 - Write files in small chunks of about 80 lines: write_file with the first chunk, then write_file with append=true for each next chunk, until the file is complete.
 - Write complete, working code. No placeholders such as "// TODO", "..." or "rest of the code here".
+- Web apps (games, calculators, tools, pages): unless the user asks for separate files, build ONE self-contained index.html: CSS in a <style> tag, JavaScript in one <script> tag at the end of <body>. Give every element your script needs an id, look it up with document.getElementById, and attach events with addEventListener (not inline onclick). Keep the logic simple and correct before adding styling.
+- After building or changing a web page, call test_app (with steps that prove the main feature works, e.g. click 2, +, 3, = and expect the display to show 5). Pages are also run automatically before you finish.
 - Act with tools instead of describing what you would do. Don't ask for permission; the user approves risky actions themselves.
 - edit_file: copy old_string exactly from the file WITHOUT the line-number prefix, with 2-3 lines of context so it is unique.
 - Paths are relative to the project root.
@@ -77,6 +79,17 @@ def _listing(cwd: Path, limit: int = 40) -> str:
 
 def detect_project(cwd: Path) -> str:
     """One line describing the project type and how to test it."""
+    kinds, test = project_info(cwd)
+    if not kinds:
+        return ""
+    line = "\n- Project: " + ", ".join(kinds)
+    if test:
+        line += f" · run tests with: {test}"
+    return line
+
+
+def project_info(cwd: Path) -> tuple[list[str], str]:
+    """(project kinds, test command) detected from the files in cwd."""
     def has(*names: str) -> bool:
         return any((cwd / n).exists() for n in names)
     kinds, test = [], ""
@@ -122,12 +135,7 @@ def detect_project(cwd: Path) -> str:
         kinds.append("C/C++ (CMake)")
     if has("Makefile") and "test:" in _read(cwd / "Makefile"):
         test = test or "make test"
-    if not kinds:
-        return ""
-    line = "\n- Project: " + ", ".join(dict.fromkeys(kinds))
-    if test:
-        line += f" · run tests with: {test}"
-    return line
+    return list(dict.fromkeys(kinds)), test
 
 
 def _read(p: Path) -> str:
@@ -268,16 +276,16 @@ def prune(messages: list[dict], budget: int, keep_recent_tools: int = 4) -> tupl
     system = msgs[0] if msgs and msgs[0].get("role") == "system" else None
     body = msgs[1:] if system else msgs
     user_starts = [i for i, m in enumerate(body)
-                   if m.get("role") == "user" and not is_tool_result(m)]
+                   if is_user_turn(m)]
     dropped_users: list[str] = []
     while len(user_starts) > 1 and estimate_tokens(([system] if system else []) + body) > budget:
         cut = user_starts[1]
         dropped_users += [str(m.get("content", ""))[:160] for m in body[:cut]
-                          if m.get("role") == "user" and not is_tool_result(m)
+                          if is_user_turn(m)
                           and not str(m.get("content", "")).startswith("[")]
         body = body[cut:]
         user_starts = [i for i, m in enumerate(body)
-                       if m.get("role") == "user" and not is_tool_result(m)]
+                       if is_user_turn(m)]
         changes += 1
     if dropped_users:
         note = {"role": "user", "content":

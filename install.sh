@@ -228,6 +228,18 @@ if ! have rg && [ -n "$PM" ]; then
   fi
 fi
 
+# ── 3b. Node.js (optional: runs web apps the model builds + checks JavaScript) ─
+if ! have node && [ -n "$PM" ]; then
+  step "Node.js (optional — lets tinycode run and test the web apps it builds)"
+  if ask "Install Node.js?" y; then
+    case "$PM" in
+      pacman) pkg_install nodejs ;;
+      brew) pkg_install node ;;
+      *) pkg_install nodejs ;;
+    esac >/dev/null 2>&1 && ok "Node.js installed" || warn "skipped (app testing and JS checks will be off)"
+  fi
+fi
+
 # ── 4. Ollama ────────────────────────────────────────────────────────────────
 OLLAMA=""
 find_ollama() {

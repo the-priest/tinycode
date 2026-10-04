@@ -22,6 +22,7 @@ class Session:
     updated: float = field(default_factory=time.time)
     messages: list[dict] = field(default_factory=list)
     todos: list[dict] = field(default_factory=list)
+    todos_auto: bool = False
     tokens_in: int = 0
     tokens_out: int = 0
 
@@ -38,7 +39,7 @@ class Session:
                           if m.get("role") == "user"), "")
             self.title = " ".join(str(first).split())[:70]
         data = {k: getattr(self, k) for k in
-                ("id", "cwd", "title", "created", "updated", "messages", "todos",
+                ("id", "cwd", "title", "created", "updated", "messages", "todos", "todos_auto",
                  "tokens_in", "tokens_out")}
         tmp = self.path.with_suffix(".tmp")
         try:

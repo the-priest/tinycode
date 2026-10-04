@@ -1,0 +1,21 @@
+<!DOCTYPE html><html><head><title>Todo</title></head><body>
+<form id="todo-form"><input id="new-todo" type="text" placeholder="What to do?"><button type="submit">Add</button></form>
+<ul id="todo-list"></ul>
+<script>
+const form = document.querySelector('#todo-form');
+const input = document.querySelector('#new-todo');
+const list = document.querySelector('#todo-list');
+let todos = JSON.parse(localStorage.getItem('todos') || '[]');
+function render() {
+  list.innerHTML = '';
+  todos.forEach((t, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="text">${t.text}</span> <button class="del" data-i="${i}">x</button>`;
+    li.querySelector('.del').addEventListener('click', () => { todos.splice(i, 1); save(); });
+    list.appendChild(li);
+  });
+}
+function save() { localStorage.setItem('todos', JSON.stringify(todos)); render(); }
+form.addEventListener('submit', e => { e.preventDefault(); const v = input.value.trim(); if (!v) return; todos.push({ text: v }); input.value = ''; save(); });
+render();
+</script></body></html>

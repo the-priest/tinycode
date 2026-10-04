@@ -225,6 +225,11 @@ def doctor() -> int:
     line(True if shutil.which("rg") else None, "ripgrep",
          shutil.which("rg") or "optional — faster search (apt install ripgrep)")
     line(True if shutil.which("git") else None, "git", shutil.which("git") or "optional")
+    node = shutil.which("node")
+    line(True if node else None, "node.js", node or
+         "optional — needed to run/test web apps and check JavaScript (apt install nodejs)")
+    from .webcheck import ASSET
+    line(ASSET.is_file(), "app runner", str(ASSET) if ASSET.is_file() else "missing asset — reinstall")
     line(True, "config", str(CONFIG_PATH) + ("" if CONFIG_PATH.exists() else " (defaults)"))
     line(True, "log", str(log_path()))
     try:

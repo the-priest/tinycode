@@ -90,6 +90,9 @@ class Config:
     max_tool_chars: int = 12000      # per tool result sent back to the model
     auto_check: bool = True          # syntax/error check after every file change
     check_rounds: int = 3            # max automatic "fix the remaining errors" rounds
+    app_check: bool = True           # run changed web pages in a simulated browser
+    run_tests: bool = True           # run the project's tests before finishing (if any)
+    test_timeout: int = 180
     bash_timeout: int = 120
     # permissions: "ask" | "auto-edit" | "yolo"
     mode: str = "ask"
@@ -206,6 +209,8 @@ DEFAULT_CONFIG_TOML = """# tinycode configuration
 [agent]
 # max_steps = 40
 # auto_check = true      # check syntax after every edit and before finishing
+# app_check = true       # run changed web pages in a simulated browser before finishing
+# run_tests = true       # run the project's tests before finishing, when code changed
 # bash_timeout = 120
 # mode = "ask"           # ask | auto-edit | yolo
 
