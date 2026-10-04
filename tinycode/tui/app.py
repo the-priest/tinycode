@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from rich.markup import escape
 from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
@@ -22,17 +21,17 @@ from textual.widget import Widget
 from textual.widgets import Collapsible, Markdown, OptionList, ProgressBar, Static
 from textual.widgets.option_list import Option
 
-from .. import APP_NAME, __version__
+from .. import APP_NAME, __version__, models
 from ..agent import Agent, AgentUI, Decision
-from ..config import Config, log, log_path, write_default_config
+from ..config import Config, log, log_path, save_setting, write_default_config
 from ..context import expand_mentions, git_branch
 from ..ollama import Ollama, OllamaError
 from ..parsing import extract_text_tool_calls, is_tool_result, is_user_turn
 from ..session import Session, ago, list_sessions
 from ..tools import IGNORED_DIRS, ToolResult
 from . import theme as T
-from .widgets import (ApprovalScreen, PickerScreen, PromptInput, ToolCallView, short,
-                      tool_target)
+from .widgets import (ApprovalScreen, Entry, Palette, PickerScreen, PromptInput, TextPrompt,
+                      ToolCallView, short, tool_target)
 
 LOGO = ["▀█▀ █ █▄ █ █▄█ █▀▀ █▀█ █▀▄ █▀▀",
         " █  █ █ ▀█  █  █▄▄ █▄█ █▄▀ ██▄"]
@@ -49,6 +48,7 @@ Keep it under 60 lines. If TINYCODE.md already exists, improve it instead."""
 
 COMMANDS: list[tuple[str, str]] = [
     ("/help", "show commands and keys"),
+    ("/settings", "settings, models and commands (ctrl+p)"),
     ("/new", "start a fresh conversation (alias /clear)"),
     ("/resume", "resume a previous conversation"),
     ("/undo", "revert the file changes of the last turn"),
@@ -57,7 +57,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/think", "toggle model reasoning on/off (ctrl+t)"),
     ("/init", "create a TINYCODE.md guide for this project"),
     ("/diff", "show files changed this session (git diff)"),
-    ("/model", "show or switch the Ollama model"),
+    ("/model", "switch model (presets, unrestricted builds, any Ollama tag)"),
     ("/cost", "token usage for this session"),
     ("/export", "save the conversation as markdown"),
     ("/config", "open the path of the config file"),
@@ -327,6 +327,7 @@ class TinyCodeApp(App):
         Binding("ctrl+b", "toggle_sidebar", show=False, priority=True),
         Binding("ctrl+l", "clear_screen", show=False, priority=True),
         Binding("ctrl+n", "new_session", show=False, priority=True),
+        Binding("ctrl+p", "palette", show=False, priority=True),
     ]
 
     def __init__(self, cfg: Config, workdir: Path, no_boot: bool = False,
@@ -442,8 +443,9 @@ class TinyCodeApp(App):
             tips.append("\nmemory ", style=T.MUTED)
             tips.append(", ".join(Path(p).name for p in self.agent.memory_files), style=T.TEXT)
         tips.append("\n\n", style=T.MUTED)
-        for k, v in (("/", "commands"), ("@", "attach a file"), ("!", "run a shell command"),
-                     ("shift+tab", "permission mode"), ("esc", "interrupt")):
+        for k, v in (("ctrl+p", "settings & models"), ("/", "commands"), ("@", "attach a file"),
+                     ("!", "run a shell command"), ("shift+tab", "permission mode"),
+                     ("esc", "interrupt")):
             tips.append(f" {k} ", style=f"bold {T.BLUE}")
             tips.append(f"{v}  ", style=T.MUTED)
         if not self.agent.memory_files:
@@ -495,6 +497,8 @@ class TinyCodeApp(App):
         b.append(f"{pct}%", style=pc)
         if self.queue:
             b.append(f"   {len(self.queue)} queued", style=T.YELLOW)
+        b.append("   ctrl+p", style=T.BLUE)
+        b.append(" settings", style=T.DIM)
         try:
             self.query_one("#bottombar", Static).update(b)
         except Exception:  # noqa: BLE001
@@ -736,7 +740,8 @@ class TinyCodeApp(App):
             await self._boot_failed(f"unexpected boot error: {exc!r}")
 
     async def _pull(self) -> None:
-        await self.bridge.notice(f"downloading {self.cfg.model} (first run only)…", "warn")
+        await self.bridge.notice(f"downloading {self.cfg.model_label} ({self.cfg.model}), "
+                                 "one time only…", "warn")
         bar = ProgressBar(total=100, show_eta=True)
         label = Static(Text("  starting download…", style=T.MUTED))
         box = Vertical(label, bar, classes="pull")
@@ -1056,13 +1061,287 @@ class TinyCodeApp(App):
     async def action_new_session(self) -> None:
         await self._command("/new")
 
+    # --------------------------------------------------------- settings
+    def action_palette(self, query: str = "") -> None:
+        if isinstance(self.screen, Palette):
+            self.screen.dismiss(None)
+            return
+        if isinstance(self.screen, ModalScreen):
+            return
+        self.push_screen(
+            Palette("Settings", self._settings_entries, self._settings_act,
+                    foot="↑↓ move · enter or click to change · type to search · saved automatically",
+                    query=query),
+            callback=self._palette_done)
+
+    @staticmethod
+    def _flag(v: bool) -> tuple[str, str]:
+        return ("on", T.GREEN) if v else ("off", T.MUTED)
+
+    def _settings_entries(self) -> list[Entry]:
+        c, a = self.cfg, self.agent
+        side_on = not self.query_one("#side").has_class("-hidden")
+
+        def flag(id_: str, label: str, on: bool, group: str, detail: str = "",
+                 key: str = "") -> Entry:
+            v, col = self._flag(on)
+            return Entry(id_, label, v, group, key, detail, col)
+
+        twin = models.counterpart(c.model)
+        unc = models.is_uncensored(c.model)
+        mcol = T.MODE_STYLE[a.mode][0]
+        e = [
+            Entry("model", "Switch model", c.model_label, "Model", "",
+                  "Pick a recommended model, an unrestricted build, or any Ollama tag. "
+                  "Downloads it if needed.", T.CYAN),
+            flag("uncensored", "Unrestricted", unc, "Model",
+                 f"switch to {twin.label}" if twin else "pick an abliterated model (no refusals)"),
+            flag("think", "Reasoning", a.think, "Model", "think before acting: slower, more careful",
+                 "ctrl+t"),
+            Entry("think_budget", "Reasoning budget",
+                  f"{c.think_budget:,} tokens" if c.think_budget else "unlimited", "Model",
+                  detail="cut off a step that thinks longer than this"),
+            Entry("num_ctx", "Context window", f"{fmt_k(c.num_ctx)} tokens", "Model",
+                  detail="more remembers more, but needs more RAM"),
+            Entry("mode", "Permission mode", a.mode, "Agent", "shift+tab",
+                  T.MODE_STYLE[a.mode][1], mcol if a.mode != "ask" else T.TEXT_SOFT),
+            flag("sandbox", "Sandbox to project", c.sandbox, "Agent",
+                 "tools can't touch anything outside this folder"),
+            flag("auto_check", "Check code after every edit", c.auto_check, "Agent",
+                 "syntax and bug checks fed back to the model"),
+            flag("app_check", "Run web apps before finishing", c.app_check, "Agent",
+                 "click through pages in a simulated browser"),
+            flag("run_tests", "Run tests before finishing", c.run_tests, "Agent",
+                 "pytest, npm test, cargo test… when code changed"),
+            flag("sidebar", "Sidebar", side_on, "Interface", key="ctrl+b"),
+            flag("show_thinking", "Show reasoning expanded", c.show_thinking, "Interface"),
+        ]
+        cmds = [("new", "New conversation", "ctrl+n"), ("resume", "Resume a conversation", ""),
+                ("undo", "Undo last turn's file changes", ""),
+                ("compact", "Compact conversation", ""), ("diff", "Files changed", ""),
+                ("init", "Create TINYCODE.md for this project", ""),
+                ("export", "Export conversation as markdown", ""), ("cost", "Token usage", ""),
+                ("config", "Config file location", ""), ("help", "Help", ""),
+                ("quit", "Quit", "ctrl+q")]
+        e += [Entry(f"cmd:/{k}", label, group="Commands", key=key) for k, label, key in cmds]
+        return e
+
+    def _save(self, key: str, value: Any) -> None:
+        try:
+            save_setting(key, value)
+        except OSError as exc:
+            self.notify(f"couldn't save {key}: {exc}", severity="warning")
+
+    def _settings_act(self, oid: str) -> bool:
+        """Toggles change in place (True keeps the palette open); everything
+        else closes it and runs in _palette_run."""
+        c, a = self.cfg, self.agent
+        if oid == "think":
+            a.think = c.think = not a.think
+            self._save("think", a.think)
+        elif oid == "mode":
+            order = ["ask", "auto-edit", "yolo"]
+            a.mode = order[(order.index(a.mode) + 1) % len(order)]
+        elif oid == "sandbox":
+            c.sandbox = not c.sandbox
+            self._save("sandbox", c.sandbox)
+            a.refresh_system_prompt()
+        elif oid in ("auto_check", "app_check", "run_tests"):
+            setattr(c, oid, not getattr(c, oid))
+            self._save(oid, getattr(c, oid))
+        elif oid == "sidebar":
+            self.action_toggle_sidebar()
+            c.sidebar = not self.query_one("#side").has_class("-hidden")
+            self._save("sidebar", c.sidebar)
+        elif oid == "show_thinking":
+            c.show_thinking = not c.show_thinking
+            self.show_thinking = self.expanded or c.show_thinking
+            for box in self.query(Collapsible):
+                if box.has_class("think"):
+                    box.collapsed = not self.show_thinking
+            self._save("show_thinking", c.show_thinking)
+        else:
+            return False
+        self.refresh_side()
+        return True
+
+    def _palette_done(self, choice: Optional[str]) -> None:
+        if choice:
+            self.run_worker(self._palette_run(choice), group="palette")
+
+    async def _palette_run(self, oid: str) -> None:
+        c = self.cfg
+        if oid.startswith("cmd:"):
+            await self._command(oid[4:])
+        elif oid == "model":
+            await self._model_picker()
+        elif oid == "uncensored":
+            twin = models.counterpart(c.model)
+            if twin:
+                await self._switch_model(twin.key)
+            else:
+                await self._model_picker(
+                    query="recommended" if models.is_uncensored(c.model) else "unrestricted")
+        elif oid == "think_budget":
+            pick = await self._choose("Reasoning budget", [
+                (1000, "fastest, for simple edits"), (2000, ""),
+                (3000, "default"), (6000, "hard problems"),
+                (0, "never cut the model off")],
+                c.think_budget, lambda v: f"{v:,} tokens" if v else "unlimited")
+            if pick is not None:
+                c.think_budget = pick
+                self._save("think_budget", pick)
+                self.notify(f"reasoning budget: {pick:,} tokens" if pick else
+                            "reasoning budget: unlimited", timeout=2)
+        elif oid == "num_ctx":
+            pick = await self._choose("Context window", [
+                (8192, "least RAM, short tasks"), (16384, "low RAM"), (32768, "default"),
+                (65536, "big projects, needs more RAM"), (131072, "huge, needs lots of RAM")],
+                c.num_ctx, lambda v: f"{fmt_k(v)} tokens")
+            if pick is not None and pick != c.num_ctx:
+                c.num_ctx = pick
+                self._save("num_ctx", pick)
+                self.refresh_side()
+                await self._reload_model(f"context window: {fmt_k(pick)} tokens")
+
+    async def _choose(self, title: str, options: list[tuple[int, str]], current: int,
+                      fmt: Callable[[int], str]) -> Optional[int]:
+        entries = [Entry(str(v), fmt(v), mark="●" if v == current else "", sub=note)
+                   for v, note in options]
+        choice = await self._pick_palette(title, entries, select=str(current),
+                                          foot="● current · enter select · esc close")
+        return int(choice) if choice is not None else None
+
+    async def _pick_palette(self, title: str, entries: list[Entry], query: str = "",
+                            foot: str = "", select: str = "") -> Optional[str]:
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.push_screen(Palette(title, lambda: entries, lambda _id: False, foot=foot,
+                                 query=query, select=select),
+                         callback=lambda r: fut.done() or fut.set_result(r))
+        return await fut
+
+    @staticmethod
+    def _installed(tag: str, names: set[str]) -> bool:
+        return tag in names or (":" not in tag and f"{tag}:latest" in names)
+
+    async def _model_picker(self, query: str = "") -> None:
+        found = [] if self.no_boot else await asyncio.to_thread(self.client.list_models)
+        names = {m.get("name", "") for m in found} | {m.get("model", "") for m in found}
+        cur = self.cfg.model
+
+        def entry(p: models.Preset, group: str) -> Entry:
+            have = self._installed(p.tag, names)
+            return Entry(f"m:{p.key}", p.label, "installed" if have else f"↓ {p.size}", group,
+                         detail=f"{p.notes}\n{p.tag}",
+                         color=T.TEAL if have else T.MUTED,
+                         mark="●" if p.tag == cur else "",
+                         sub=f"{p.params.split(' (')[0]} · {p.speed}")
+
+        e = [entry(p, "Recommended") for p in models.PRESETS if not p.uncensored]
+        e += [entry(p, "Unrestricted — refusals removed") for p in models.PRESETS if p.uncensored]
+        known = {p.tag for p in models.PRESETS}
+        for m in sorted(found, key=lambda m: m.get("name", "")):
+            name = m.get("name", "")
+            if name and name not in known and not any(self._installed(t, {name}) for t in known):
+                e.append(Entry(f"t:{name}", models.label_for(name), "installed", "Installed",
+                               detail=f"{name}\n{(m.get('size') or 0) / 1e9:.1f} GB on disk",
+                               color=T.TEAL, mark="●" if name == cur else ""))
+        e.append(Entry("custom", "Any Ollama model…", "", "Other",
+                       detail="Type a tag, e.g. qwen3:8b or hf.co/user/repo-GGUF:Q4_K_M.\n"
+                              "It must support tool calling."))
+        current = next((x.id for x in e if x.mark), "")
+        choice = await self._pick_palette(
+            "Switch model", e, query=query, select=current,
+            foot="● current · enter to switch (downloads if needed) · esc close")
+        if not choice:
+            return
+        if choice == "custom":
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            self.push_screen(TextPrompt("Use any Ollama model",
+                                        "e.g. qwen3:8b  or  hf.co/user/repo-GGUF:Q4_K_M",
+                                        "It is downloaded if needed. It must support tool calling."),
+                             callback=lambda r: fut.done() or fut.set_result(r))
+            choice = await fut
+            if choice:
+                await self._switch_model(choice)
+            return
+        await self._switch_model(choice.split(":", 1)[1])
+
+    async def _switch_model(self, name: str) -> None:
+        if self.agent.busy:
+            self.notify("busy — press esc to interrupt first", severity="warning")
+            return
+        p = models.find(name)
+        tag = p.tag if p else name.strip()
+        c = self.cfg
+        if not tag:
+            return
+        if tag == c.model:
+            await self.bridge.notice(f"already using {c.model_label}", "dim")
+            return
+        saved = {k: getattr(c, k) for k in ("model", "model_label", *models.SAMPLING_KEYS)}
+        saved_extra = {k: c.extra.get(k) for k in ("stop", "min_p", "family")}
+        explicit = set(c.extra.get("explicit") or ()) - {"model", "model_label"}
+        old_label = c.model_label
+        self.ready = False
+        try:
+            if not self.no_boot and await asyncio.to_thread(self.client.alive, 1.5):
+                self.boot_status = f"unloading {old_label}…"
+                await asyncio.to_thread(self.client.unload, 8)   # free its RAM first
+            c.model = tag
+            models.apply(c, explicit)
+            self.agent.model_changed()
+            self.refresh_chrome()
+            await self.bridge.notice(f"switching to {c.model_label}…", "dim")
+            size = ""
+            if not self.no_boot:
+                self.boot_status = "checking model…"
+                if not await asyncio.to_thread(self.client.has_model):
+                    await self._pull()
+                self.boot_status = f"loading {c.model_label} into memory…"
+                self.model_info = await asyncio.to_thread(self.client.load) or {}
+                if self.model_info.get("size"):
+                    size = f" ({self.model_info['size'] / 1e9:.1f} GB)"
+            self._save("model", p.key if p else tag)
+            self._save("model_label", None)
+            c.extra["explicit"] = explicit | {"model"}
+            await self.bridge.notice(f"✓ now using {c.model_label}{size} · saved as your default",
+                                     "ok")
+        except OllamaError as exc:
+            for k, v in saved.items():
+                setattr(c, k, v)
+            c.extra.update(saved_extra)
+            self.agent.model_changed()
+            await self.bridge.notice(f"✗ couldn't switch to {tag}: {exc}", "error")
+            await self.bridge.notice(f"still using {c.model_label}", "dim")
+        finally:
+            self._set_ready()
+            self.refresh_chrome()
+
+    async def _reload_model(self, why: str) -> None:
+        """Reload the model so a new context size takes effect now rather
+        than on the next message."""
+        if self.no_boot or not self.ready or self.agent.busy:
+            await self.bridge.notice(f"✓ {why} · takes effect on the next message", "ok")
+            return
+        self.ready = False
+        self.boot_status = f"reloading {self.cfg.model_label}…"
+        try:
+            self.model_info = await asyncio.to_thread(self.client.load) or {}
+            self.agent.model_changed()
+            await self.bridge.notice(f"✓ {why} · model reloaded", "ok")
+        except OllamaError as exc:
+            await self.bridge.notice(f"✗ reload failed: {exc}", "error")
+        finally:
+            self._set_ready()
+
     # --------------------------------------------------------- commands
     async def _command(self, text: str) -> None:
         cmd, _, arg = text.partition(" ")
         cmd = cmd.lower()
         arg = arg.strip()
         if self.agent.busy and cmd not in ("/quit", "/exit", "/q", "/help", "/cost",
-                                           "/mode", "/think", "/sidebar"):
+                                           "/mode", "/think", "/sidebar", "/settings"):
             self.notify("busy — press esc to interrupt first", severity="warning")
             return
         note = self.bridge.notice
@@ -1135,7 +1414,9 @@ class TinyCodeApp(App):
         elif cmd == "/config":
             p = write_default_config()
             await note(f"config: {p}  (restart tinycode after editing)", "info")
-        elif cmd == "/model":
+        elif cmd in ("/settings", "/options", "/palette"):
+            self.action_palette()
+        elif cmd in ("/model", "/models"):
             await self._model(arg)
         elif cmd == "/resume":
             await self._resume()
@@ -1166,7 +1447,8 @@ class TinyCodeApp(App):
             t.append(f"  {k:<10}", style=T.TEXT)
             t.append(f" {d}\n", style=T.MUTED)
         t.append("\nKeys\n", style=f"bold {T.BLUE}")
-        for k, d in (("esc", "interrupt the agent"), ("shift+tab", "cycle permission mode"),
+        for k, d in (("ctrl+p", "settings, models and commands"),
+                     ("esc", "interrupt the agent"), ("shift+tab", "cycle permission mode"),
                      ("ctrl+t", "reasoning on/off"), ("ctrl+o", "expand tool output & thinking"),
                      ("ctrl+b", "sidebar"), ("ctrl+n", "new conversation"),
                      ("ctrl+l", "clear screen"), ("ctrl+c ×2", "quit (ctrl+q / ctrl+d too)")):
@@ -1200,33 +1482,9 @@ class TinyCodeApp(App):
 
     async def _model(self, arg: str) -> None:
         if arg:
-            old = self.cfg.model
-            self.cfg.model = arg
-            self.cfg.model_label = arg.split("/")[-1]
-            await self.bridge.notice(f"switching model to {arg}…", "dim")
-            self.ready = False
-            try:
-                if not await asyncio.to_thread(self.client.has_model):
-                    await self._pull()
-                await asyncio.to_thread(self.client.load)
-                self.client.supports_think = None
-                await self.bridge.notice(f"✓ now using {arg}", "ok")
-            except OllamaError as exc:
-                self.cfg.model = old
-                await self.bridge.notice(f"model switch failed: {exc}", "error")
-            self.ready = True
-            self.refresh_chrome()
-            self.refresh_side()
-            return
-        models = await asyncio.to_thread(self.client.list_models)
-        items = [(m.get("name", ""), f"{m.get('name', '')}  ·  {m.get('size', 0) / 1e9:.1f} GB")
-                 for m in models]
-        if not items:
-            await self.bridge.notice(f"model: {self.cfg.model}", "info")
-            return
-        choice = await self._pick("Switch model", items)
-        if choice and choice != self.cfg.model:
-            await self._model(choice)
+            await self._switch_model(arg)
+        else:
+            await self._model_picker()
 
     async def _pick(self, title: str, items: list[tuple[str, str]]) -> Optional[str]:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()

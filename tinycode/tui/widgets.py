@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
-
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 from rich.console import Group
 from rich.markup import escape
@@ -280,16 +280,16 @@ def render_split_diff(diff: str, max_rows: int = 60) -> Table:
     tbl.add_column("", justify="right", style=T.DIM, width=5, no_wrap=True)
     tbl.add_column("after", ratio=1, no_wrap=True, overflow="ellipsis")
     rows = _hunk_rows(diff)
-    for kind, on, ot, nn, nt in rows[:max_rows]:
+    for kind, no, ot, nn, nt in rows[:max_rows]:
         if kind == "gap":
             tbl.add_row("", Text("⋮", style=T.DIM), "", Text("⋮", style=T.DIM))
             continue
         if kind == "ctx":
-            tbl.add_row(str(on), Text(ot, style=T.TEXT_SOFT), str(nn), Text(nt, style=T.TEXT_SOFT))
+            tbl.add_row(str(no), Text(ot, style=T.TEXT_SOFT), str(nn), Text(nt, style=T.TEXT_SOFT))
             continue
-        left = Text(ot, style=f"{T.RED} on #2a1619") if on is not None else Text("")
+        left = Text(ot, style=f"{T.RED} on #2a1619") if no is not None else Text("")
         right = Text(nt, style=f"{T.GREEN} on #16261a") if nn is not None else Text("")
-        tbl.add_row("" if on is None else str(on), left, "" if nn is None else str(nn), right)
+        tbl.add_row("" if on is None else str(no), left, "" if nn is None else str(nn), right)
     if len(rows) > max_rows:
         tbl.add_row("", Text(f"… {len(rows) - max_rows} more rows (ctrl+o)", style=T.MUTED), "", "")
     return tbl
@@ -641,3 +641,218 @@ class PickerScreen(ModalScreen):
     def action_close(self) -> None:
         self.dismiss(None)
 
+
+
+# ------------------------------------------------------- command palette
+
+@dataclass
+class Entry:
+    """One row of the palette."""
+    id: str
+    label: str
+    value: str = ""          # current setting, shown on the right
+    group: str = ""
+    key: str = ""            # keyboard shortcut, shown dim
+    detail: str = ""         # description, shown below the list when highlighted
+    color: str = ""          # colour of the value
+    mark: str = ""           # "●" for the current choice
+    sub: str = ""            # dim note next to the label
+
+
+class Palette(ModalScreen):
+    """Settings & commands (ctrl+p): searchable, clickable, keyboard-driven.
+
+    `build()` returns the entries. `act(id)` handles a choice: it returns True
+    to keep the palette open (a toggle, re-rendered in place) or False to close
+    the palette, which then dismisses with that id."""
+
+    DEFAULT_CSS = f"""
+    Palette {{ align: center top; background: {T.BG} 55%; }}
+    #pal {{ width: 84; max-width: 96%; height: auto; margin: 2 0 0 0;
+            background: {T.PANEL}; border: round {T.BLUE}; padding: 0 1; }}
+    #pal-head {{ height: 1; margin: 1 1 0 1; }}
+    #pal-title {{ width: 1fr; color: {T.TEXT}; text-style: bold; }}
+    #pal-esc {{ width: auto; color: {T.MUTED}; }}
+    #pal-search {{ height: 1; border: none; background: {T.PANEL}; padding: 0 1;
+                   margin: 1 0 0 0; color: {T.TEXT}; }}
+    #pal-search:focus {{ border: none; background-tint: transparent; }}
+    #pal-search > .input--placeholder {{ color: {T.MUTED}; }}
+    #pal-list {{ height: auto; max-height: 20; background: {T.PANEL}; border: none;
+                 margin: 1 0 0 0; scrollbar-size-vertical: 1; }}
+    #pal-list:focus {{ border: none; background-tint: transparent; }}
+    #pal-list > .option-list--option-highlighted {{ background: {T.BLUE} 22%; }}
+    #pal-list > .option-list--option-hover {{ background: {T.DIM} 60%; }}
+    #pal-list > .option-list--option-disabled {{ color: {T.BLUE}; }}
+    #pal-desc {{ height: 3; color: {T.TEXT_SOFT}; margin: 1 1 0 1; }}
+    #pal-foot {{ height: 1; color: {T.MUTED}; margin: 1 1 1 1; }}
+    """
+    BINDINGS = [
+        Binding("escape", "close", show=False),
+        Binding("down", "move(1)", show=False),
+        Binding("up", "move(-1)", show=False),
+        Binding("pagedown", "move(8)", show=False),
+        Binding("pageup", "move(-8)", show=False),
+    ]
+
+    def __init__(self, title: str, build: Callable[[], list[Entry]],
+                 act: Callable[[str], bool], foot: str = "", query: str = "",
+                 select: str = ""):
+        super().__init__()
+        self.title_text = title
+        self._build = build
+        self._act = act
+        self.foot = foot or "↑↓ move · enter select · type to search · esc close"
+        self.start_query = query
+        self.select = select
+        self.entries: list[Entry] = []
+        self._keys = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pal"):
+            with Horizontal(id="pal-head"):
+                yield Static(self.title_text, id="pal-title")
+                yield Static("esc", id="pal-esc")
+            yield Input(value=self.start_query, placeholder="Search", id="pal-search")
+            yield OptionList(id="pal-list")
+            yield Static("", id="pal-desc")
+            yield Static(self.foot, id="pal-foot")
+
+    def on_mount(self) -> None:
+        self.entries = self._build()
+        self.query_one("#pal-desc").display = any(e.detail for e in self.entries)
+        self._fit()
+        self._fill(self.start_query, keep=self.select)
+        self.query_one("#pal-search", Input).focus()
+
+    def on_resize(self) -> None:
+        self._fit()
+
+    def _fit(self) -> None:
+        """Give the list whatever height is left, so the search box, the
+        description and the key hints always stay on screen."""
+        chrome = 17 if self.query_one("#pal-desc").display else 13
+        self.query_one("#pal-list").styles.max_height = max(4, self.size.height - chrome)
+
+    # ---- rendering
+    def _row(self, e: Entry) -> Table:
+        grid = Table.grid(expand=True, padding=(0, 1))
+        grid.add_column(width=1, no_wrap=True)
+        grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        grid.add_column(justify="right", no_wrap=True)
+        cells = [Text(e.mark, style=T.GREEN),
+                 Text.assemble((e.label, T.TEXT), ("  " + e.sub if e.sub else "", T.MUTED)),
+                 Text(e.value, style=e.color or T.TEXT_SOFT)]
+        if self._keys:
+            grid.add_column(width=self._keys, justify="right", no_wrap=True)
+            cells.append(Text(e.key, style=T.MUTED))
+        grid.add_row(*cells)
+        return grid
+
+    def _matches(self, e: Entry, terms: list[str]) -> bool:
+        hay = f"{e.group} {e.label} {e.sub} {e.value} {e.id}".lower()
+        return all(t in hay for t in terms)
+
+    def _fill(self, query: str, keep: Optional[str] = None) -> None:
+        ol = self.query_one("#pal-list", OptionList)
+        self._keys = max((len(e.key) for e in self.entries), default=0)
+        terms = query.lower().split()
+        shown = [e for e in self.entries if self._matches(e, terms)]
+        opts: list[Option] = []
+        group = None
+        for e in shown:
+            if e.group != group and e.group:
+                head = Text(("\n" if opts else "") + e.group, style=f"bold {T.BLUE}")
+                opts.append(Option(head, disabled=True))
+            group = e.group
+            opts.append(Option(self._row(e), id=e.id))
+        if not opts:
+            opts.append(Option(Text("  nothing matches", style=T.MUTED), disabled=True))
+        ol.clear_options()
+        ol.add_options(opts)
+        ids = [o.id for o in opts]
+        target = keep if keep and keep in ids else next((o.id for o in opts if o.id), None)
+        if target is not None:
+            ol.highlighted = ids.index(target)
+        self._describe(target)
+
+    def _describe(self, oid: Optional[str]) -> None:
+        e = next((e for e in self.entries if e.id == oid), None)
+        self.query_one("#pal-desc", Static).update(Text(e.detail if e else "", style=T.TEXT_SOFT))
+
+    @on(OptionList.OptionHighlighted, "#pal-list")
+    def _highlighted(self, ev: OptionList.OptionHighlighted) -> None:
+        self._describe(ev.option.id)
+
+    # ---- events
+    @on(Input.Changed, "#pal-search")
+    def _search(self, ev: Input.Changed) -> None:
+        self._fill(ev.value)
+
+    @on(Input.Submitted, "#pal-search")
+    def _enter(self, ev: Input.Submitted) -> None:
+        ol = self.query_one("#pal-list", OptionList)
+        if ol.highlighted is not None:
+            opt = ol.get_option_at_index(ol.highlighted)
+            if opt.id and not opt.disabled:
+                self._choose(opt.id)
+
+    @on(OptionList.OptionSelected, "#pal-list")
+    def _picked(self, ev: OptionList.OptionSelected) -> None:
+        if ev.option.id:
+            self._choose(ev.option.id)
+        self.query_one("#pal-search", Input).focus()
+
+    def _choose(self, oid: str) -> None:
+        if self._act(oid):
+            self.entries = self._build()
+            self._fill(self.query_one("#pal-search", Input).value, keep=oid)
+        else:
+            self.dismiss(oid)
+
+    def action_move(self, n: int) -> None:
+        ol = self.query_one("#pal-list", OptionList)
+        for _ in range(abs(n)):
+            if n > 0:
+                ol.action_cursor_down()
+            else:
+                ol.action_cursor_up()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class TextPrompt(ModalScreen):
+    """Ask for one line of text (e.g. a custom model tag)."""
+
+    DEFAULT_CSS = f"""
+    TextPrompt {{ align: center top; background: {T.BG} 55%; }}
+    #tp {{ width: 84; max-width: 96%; height: auto; margin: 2 0 0 0;
+           background: {T.PANEL}; border: round {T.BLUE}; padding: 1 2; }}
+    #tp-title {{ color: {T.TEXT}; text-style: bold; }}
+    #tp-in {{ margin: 1 0; border: round {T.BORDER}; background: {T.BG}; }}
+    #tp-in:focus {{ border: round {T.BLUE}; }}
+    #tp-hint {{ color: {T.MUTED}; }}
+    """
+    BINDINGS = [Binding("escape", "close", show=False)]
+
+    def __init__(self, title: str, placeholder: str = "", hint: str = ""):
+        super().__init__()
+        self.title_text = title
+        self.placeholder = placeholder
+        self.hint = hint
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="tp"):
+            yield Static(self.title_text, id="tp-title")
+            yield Input(placeholder=self.placeholder, id="tp-in")
+            yield Static(self.hint + "\nenter confirm · esc cancel", id="tp-hint")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    @on(Input.Submitted)
+    def _done(self, ev: Input.Submitted) -> None:
+        self.dismiss(ev.value.strip() or None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)

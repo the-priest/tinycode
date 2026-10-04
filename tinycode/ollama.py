@@ -415,9 +415,14 @@ class Ollama:
     # ------------------------------------------------------------------ chat
     def options(self) -> dict:
         c = self.cfg
-        return {"temperature": c.temperature, "top_p": c.top_p, "top_k": c.top_k,
+        opts = {"temperature": c.temperature, "top_p": c.top_p, "top_k": c.top_k,
                 "num_ctx": c.num_ctx, "num_predict": c.num_predict,
                 "repeat_penalty": c.repeat_penalty}
+        if c.extra.get("stop"):
+            opts["stop"] = list(c.extra["stop"])
+        if c.extra.get("min_p") is not None:
+            opts["min_p"] = c.extra["min_p"]
+        return opts
 
     def chat_stream(self, messages: list[dict], tools: list[dict] | None = None,
                     think: Optional[bool] = None,

@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MODEL = "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M"
+DEFAULT_MODEL = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
 
 
 def _xdg(var: str, fallback: str) -> Path:
@@ -71,7 +71,7 @@ def log(msg: str) -> None:
 class Config:
     # model + server
     model: str = DEFAULT_MODEL
-    model_label: str = "LFM2.5-8B-A1B"
+    model_label: str = "Ling-3.0-tiny"
     host: str = "127.0.0.1:11434"
     # sampling / budget
     num_ctx: int = 32768
@@ -79,8 +79,10 @@ class Config:
     temperature: float = 0.6
     top_p: float = 0.95
     top_k: int = 20
-    repeat_penalty: float = 1.05
+    repeat_penalty: float = 1.0       # penalties hurt code (identifiers repeat)
     think: bool = True               # let the model reason before acting
+    think_budget: int = 3000         # max reasoning tokens per step (0 = unlimited)
+    preserve_thinking: bool = True   # keep reasoning in history (cache-friendly)
     # "native": Ollama's built-in tool calling (default, most reliable).
     # "stream": experimental — the model writes tool calls as text so files can
     #           be shown live while generated.
@@ -165,6 +167,7 @@ def _read_toml(path: Path) -> dict:
 def load_config(overrides: dict | None = None) -> Config:
     cfg = Config()
     known = {f.name: f for f in fields(Config) if f.name != "extra"}
+    explicit: set[str] = set()
 
     def apply(src: dict) -> None:
         for k, v in src.items():
@@ -172,6 +175,7 @@ def load_config(overrides: dict | None = None) -> Config:
             if k in known and v is not None:
                 try:
                     setattr(cfg, k, _coerce(v, getattr(cfg, k)))
+                    explicit.add(k)
                 except (TypeError, ValueError):
                     log(f"bad config value for {k}: {v!r}")
 
@@ -191,6 +195,9 @@ def load_config(overrides: dict | None = None) -> Config:
     if cfg.tool_mode not in ("stream", "native"):
         cfg.tool_mode = "native"
     cfg.num_ctx = max(2048, cfg.num_ctx)
+    from . import models
+    models.apply(cfg, explicit)
+    cfg.extra["explicit"] = explicit
     return cfg
 
 
@@ -199,8 +206,7 @@ DEFAULT_CONFIG_TOML = """# tinycode configuration
 # Uncomment a line and change it to override that setting.
 
 [model]
-# model = "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M"
-# model_label = "LFM2.5-8B-A1B"
+# model = "ling"         # a preset (see `tinycode models`) or any Ollama tag
 # host = "127.0.0.1:11434"
 # num_ctx = 32768        # context window (tokens). Lower it if you run out of RAM.
 # num_predict = 16384    # max tokens per model step
@@ -233,8 +239,8 @@ _V200_TEMPLATE = """# tinycode configuration
 # Every key is optional; delete what you don't need.
 
 [model]
-model = "hf.co/LiquidAI/LFM2.5-8B-A1B-GGUF:Q4_K_M"
-model_label = "LFM2.5-8B-A1B"
+model = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
+model_label = "Ling-3.0-tiny"
 host = "127.0.0.1:11434"
 num_ctx = 16384        # context window (tokens). Lower it if you run out of RAM.
 num_predict = 4096     # max tokens per model step
@@ -272,4 +278,57 @@ def write_default_config() -> Path:
     _ensure(CONFIG_DIR)
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text(DEFAULT_CONFIG_TOML, encoding="utf-8")
+    return CONFIG_PATH
+
+
+_SECTIONS = {
+    "model": ("model", "model_label", "host", "num_ctx", "num_predict", "temperature", "top_p",
+              "top_k", "repeat_penalty", "think", "think_budget", "preserve_thinking",
+              "tool_mode"),
+    "agent": ("max_steps", "max_tool_chars", "auto_check", "check_rounds", "app_check",
+              "run_tests", "test_timeout", "bash_timeout", "mode", "sandbox"),
+    "ollama": ("manage_server", "stop_server_on_exit", "unload_on_exit"),
+    "ui": ("show_thinking", "sidebar"),
+}
+
+
+def _toml_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def save_setting(key: str, value: Any) -> Path:
+    """Set one key in config.toml, keeping the rest of the file (and its
+    comments) as it is. Replaces an existing or commented-out line, or adds
+    the key to its section. value=None comments the key out."""
+    import re
+    write_default_config()
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    lines = text.split("\n")
+    if value is None:      # unset: comment the line out
+        rx = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        lines = ["# " + l.lstrip() if rx.match(l) else l for l in lines]
+        CONFIG_PATH.write_text("\n".join(lines), encoding="utf-8")
+        return CONFIG_PATH
+    line = f"{key} = {_toml_value(value)}"
+    rx = re.compile(rf"^\s*#?\s*{re.escape(key)}\s*=")
+    for i, l in enumerate(lines):
+        if rx.match(l):
+            comment = ""
+            m = re.search(r"\s+#\s.*$", l.split("=", 1)[1]) if "=" in l else None
+            if m and not l.lstrip().startswith("#"):
+                comment = m.group(0)
+            lines[i] = line + comment
+            break
+    else:
+        section = next((s for s, keys in _SECTIONS.items() if key in keys), "agent")
+        try:
+            at = lines.index(f"[{section}]") + 1
+            lines.insert(at, line)
+        except ValueError:
+            lines += ["", f"[{section}]", line]
+    CONFIG_PATH.write_text("\n".join(lines), encoding="utf-8")
     return CONFIG_PATH
