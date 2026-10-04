@@ -171,7 +171,10 @@ class Tools:
         self.cfg = cfg
         self.on_todos = on_todos
         self.todos: list[dict] = []
+        self.todos_auto = False     # True while the list is tinycode's own step log
         self.read_files: set[str] = set()
+        # path -> (mtime_ns, size) when the model last saw the whole file
+        self.seen: dict[str, tuple[int, int]] = {}
         # undo support: path -> original bytes (None = file did not exist)
         self.checkpoint: dict[str, Optional[bytes]] = {}
         self.changed: dict[str, list[int]] = {}   # path -> [added, removed]
@@ -293,10 +296,18 @@ class Tools:
         if _is_binary(p):
             return ToolResult(f"ERROR: {self.rel(p)} is a binary file "
                               f"({p.stat().st_size} bytes).", ok=False, summary="binary file")
-        text = p.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines()
         offset = max(1, int(offset or 1))
         limit = min(max(1, int(limit or 400)), 2000)
+        st = p.stat()
+        text = p.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        if offset == 1 and limit >= len(lines) and \
+                self.seen.get(str(p)) == (st.st_mtime_ns, st.st_size):
+            return ToolResult(
+                f"{self.rel(p)} has not changed since you last read or wrote it "
+                f"({len(lines)} lines), so its content is already in this conversation. "
+                "If the task is done, stop and give the user a short summary.",
+                summary="unchanged since last seen — skipped re-read")
         chunk = lines[offset - 1: offset - 1 + limit]
         body = "\n".join(f"{i:>6}\t{l if len(l) <= 500 else l[:500] + ' …'}"
                          for i, l in enumerate(chunk, start=offset))
@@ -307,6 +318,8 @@ class Tools:
         if offset > 1 or end < len(lines):
             header += f" (showing {offset}-{end}; use offset to read more)"
         self.read_files.add(str(p))
+        if offset == 1 and end >= len(lines):
+            self.seen[str(p)] = (st.st_mtime_ns, st.st_size)
         out = _truncate(f"{header}\n{body}", self._limit())
         return ToolResult(out, summary=f"read {len(chunk)} lines", detail=body)
 
@@ -327,6 +340,8 @@ class Tools:
         diff = unified_diff(before, content, self.rel(p))
         self._track(p, diff)
         self.read_files.add(str(p))
+        st = p.stat()
+        self.seen[str(p)] = (st.st_mtime_ns, st.st_size)
         n = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
         verb = "appended to" if (append and existed) else ("overwrote" if existed else "created")
         add, rem = diff_stats(diff)
@@ -621,6 +636,7 @@ class Tools:
             if content:
                 clean.append({"content": content, "status": status})
         self.todos = clean
+        self.todos_auto = False
         if self.on_todos:
             self.on_todos(clean)
         done = sum(1 for t in clean if t["status"] == "completed")

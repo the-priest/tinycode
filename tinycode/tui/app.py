@@ -66,6 +66,10 @@ COMMANDS: list[tuple[str, str]] = [
 ]
 
 
+def todos_present(agent: Any) -> bool:
+    return bool(agent.tools.todos)
+
+
 def fmt_k(n: int) -> str:
     if n >= 1024 and n % 1024 == 0:
         return f"{n // 1024}k"
@@ -222,7 +226,7 @@ class Bridge(AgentUI):
         finally:
             self.app.pending_approval = None
         if view is not None:
-            view.state = "running"
+            view.set_running()
         if choice == "always":
             self.app.notify(f"won't ask again {label}", timeout=3)
             return Decision(True, always=True)
@@ -353,6 +357,8 @@ class TinyCodeApp(App):
         self.current_tool: Optional[ToolCallView] = None
         self.pending_approval: Optional[asyncio.Future] = None
         self.branch = git_branch(workdir)
+        from . import widgets as _w
+        _w.DISPLAY_ROOT = str(workdir)
         self.model_info: dict = {}
         self._spin = 0
         self._turn_start = 0.0
@@ -571,7 +577,8 @@ class TinyCodeApp(App):
         self.query_one("#side-context", Static).update(c)
         # plan
         p = Text()
-        p.append("PLAN\n", style=f"bold {T.BLUE}")
+        p.append("STEPS\n" if a.tools.todos_auto and todos_present(a) else "PLAN\n",
+                 style=f"bold {T.BLUE}")
         todos = a.tools.todos
         if not todos:
             p.append("no plan yet", style=T.DIM)
@@ -580,7 +587,8 @@ class TinyCodeApp(App):
         for td in todos[:14]:
             ic, colr = icons[td["status"]]
             p.append(f"{ic} ", style=colr)
-            style = f"strike {T.MUTED}" if td["status"] == "completed" else (
+            done_style = T.MUTED if a.tools.todos_auto else f"strike {T.MUTED}"
+            style = done_style if td["status"] == "completed" else (
                 f"bold {T.TEXT}" if td["status"] == "in_progress" else T.TEXT_SOFT)
             p.append(short(td["content"], 31) + "\n", style=style)
         self.query_one("#side-plan", Static).update(p)
@@ -799,9 +807,11 @@ class TinyCodeApp(App):
             self.notify("queued — will send when the current turn finishes", timeout=2)
             self._refresh_bottom()
             return
+        self.agent.busy = True   # claim the agent now so a fast second message queues
         self.run_worker(self._turn(text), group="agent")
 
     async def _turn(self, text: str) -> None:
+        self.agent.busy = True
         self.bridge.live_tokens = 0
         self.gen_estimate = 0
         self._turn_start = time.monotonic()
@@ -821,8 +831,9 @@ class TinyCodeApp(App):
                 self.query_one("#prompt-box").remove_class("-busy")
             except Exception:  # noqa: BLE001 - app may be shutting down
                 return
+            self.agent.busy = False
             el = time.monotonic() - self._turn_start
-            if el > 3:
+            if el > 3 and not self.agent._cancel:
                 await self.bridge.notice(f"✻ done in {el:.0f}s", "dim")
             self.session.messages = self.agent.messages
             self.session.todos = self.agent.tools.todos
@@ -832,6 +843,7 @@ class TinyCodeApp(App):
             self.refresh_side()
             if self.queue and self.ready:
                 nxt = self.queue.pop(0)
+                self.agent.busy = True
                 self.run_worker(self._turn(nxt), group="agent")
             self._refresh_bottom()
 

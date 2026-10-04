@@ -272,3 +272,53 @@ async def test_broken_tool_call_from_ollama_is_retried(project):
         assert "append=true" in fake.requests[1]["messages"][-1]["content"]
     assert (project / "t.html").exists()
     assert any(e[0] == "notice" and "broken" in e[1] for e in ui.events)
+
+
+async def test_reread_of_unchanged_file_is_short_and_steps_fill_plan(project):
+    class UI(RecUI):
+        async def todos(self, todos):
+            self.events.append(("todos", [dict(t) for t in todos]))
+
+    replies = [
+        {"content": "Writing the page.", "tool_calls": [{"name": "write_file", "arguments": {
+            "path": str(project / "t.html"), "content": "<html>\n" * 50}}]},
+        {"content": "Checking the file.", "tool_calls": [{"name": "read_file",
+                                                          "arguments": {"path": "t.html"}}]},
+        {"content": "Done."},
+    ]
+    with FakeOllama(replies) as fake:
+        ui = UI()
+        agent = make(project, fake, ui, mode="yolo")
+        await agent.run("make a page")
+    results = [m["content"] for m in agent.messages if is_tool_result(m)]
+    assert "has not changed since you last read or wrote it" in results[1]
+    plans = [e[1] for e in ui.events if e[0] == "todos"]
+    assert [t["content"] for t in plans[-1]] == ["Writing the page", "Checking the file"]
+    assert all(t["status"] == "completed" for t in plans[-1])
+    assert agent.tools.todos_auto
+
+
+async def test_model_plan_wins_over_auto_steps(project):
+    replies = [
+        {"tool_calls": [{"name": "todowrite", "arguments": {"todos": [
+            {"content": "Write HTML", "status": "in_progress"}]}}]},
+        {"tool_calls": [{"name": "list_dir", "arguments": {}}]},
+        {"content": "ok"},
+    ]
+    with FakeOllama(replies) as fake:
+        agent = make(project, fake)
+        await agent.run("x")
+    assert [t["content"] for t in agent.tools.todos] == ["Write HTML"]
+    assert not agent.tools.todos_auto
+
+
+def test_changed_file_is_read_again(project):
+    from tinycode.tools import Tools
+    import os, time
+    t = Tools(project, Config())
+    assert "return a - b" in t.t_read_file("calc.py").output
+    (project / "calc.py").write_text("changed\nsecond\n")
+    os.utime(project / "calc.py", (time.time() + 5, time.time() + 5))
+    assert "changed" in t.t_read_file("calc.py").output
+    assert "has not changed" in t.t_read_file("calc.py").output
+    assert "1\tchanged" in t.t_read_file("calc.py", offset=1, limit=1).output

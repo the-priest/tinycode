@@ -85,6 +85,7 @@ class Agent:
         self.think = cfg.think
         self.always: set[str] = set()
         self.undo_stack: list[dict] = []
+        self._step_note = ""
         self.busy = False
         self._cancel = False
         self._stream: Optional[ChatStream] = None
@@ -108,6 +109,7 @@ class Agent:
         self.messages = [{"role": "system", "content": self.system_prompt}]
         self.tools.todos = []
         self.tools.read_files.clear()
+        self.tools.seen.clear()
         self.undo_stack.clear()
         self.last_prompt_tokens = 0
 
@@ -135,6 +137,10 @@ class Agent:
         self.tools.cancel.clear()
         self.turn_started = time.monotonic()
         self.messages.append({"role": "user", "content": user_text})
+        if self.tools.todos_auto or not self.tools.todos:
+            self.tools.todos = []
+            self.tools.todos_auto = True
+        self._step_note = ""
         final_text = ""
         recent: dict[str, int] = {}
         retries = 0
@@ -231,6 +237,7 @@ class Agent:
 
                 if calls or errors:
                     retries = 0
+                    self._step_note = content.strip()
                     self._record_assistant(content.strip(), calls, res.content)
                     for err in errors:
                         self._add_result("", f"ERROR: {err}")
@@ -262,6 +269,10 @@ class Agent:
             log(f"model error: {exc}")
             await self.ui.notice(f"model error: {exc}", "error")
         finally:
+            if self.tools.todos_auto and self.tools.todos:
+                for t in self.tools.todos:
+                    t["status"] = "completed"
+                await self.ui.todos(self.tools.todos)
             cp = self.tools.take_checkpoint()
             if cp:
                 self.undo_stack.append(cp)
@@ -279,6 +290,7 @@ class Agent:
             return
         self.messages, n = prune(self.messages, budget)
         if n:
+            self.tools.seen.clear()   # pruned output must be re-readable
             await self.ui.notice("context nearly full — trimmed old tool output", "dim")
 
     async def _model_step(self, think: bool, nudge: Optional[str]) -> StepResult:
@@ -314,6 +326,7 @@ class Agent:
         content: list[str] = []
         thinking: list[str] = []
         think_start = 0.0
+        think_last = 0.0
         think_open = False
         suppress = False   # hide raw text tool calls while streaming
 
@@ -353,6 +366,7 @@ class Agent:
                 if not think_open:
                     think_open = True
                     think_start = time.monotonic()
+                think_last = time.monotonic()
                 thinking.append(t)
                 await self.ui.thinking_delta(t)
                 if guard.feed(t):
@@ -361,7 +375,7 @@ class Agent:
             if c:
                 if think_open:
                     think_open = False
-                    res.think_seconds = time.monotonic() - think_start
+                    res.think_seconds = think_last - think_start
                     await self.ui.thinking_end(res.think_seconds)
                 content.append(c)
                 so_far = "".join(content)
@@ -411,7 +425,7 @@ class Agent:
                 if self._stream is not None:
                     self._stream.close()
         if think_open:
-            res.think_seconds = time.monotonic() - think_start
+            res.think_seconds = think_last - think_start
             await self.ui.thinking_end(res.think_seconds)
         if self._cancel:
             res.aborted = "cancel"
@@ -485,6 +499,9 @@ class Agent:
             if decision.always:
                 self.always.add(key)
 
+        if name != "todowrite":
+            await self._log_step(name, args)
+
         def on_out(text: str) -> None:
             self.ui.tool_output(call_id, text)
         self.tools.on_output = on_out
@@ -497,6 +514,31 @@ class Agent:
             result.output += (f"\n\nNOTE: you have made this exact {name} call "
                               f"{recent[sig]} times. Do something different, or finish.")
         await self._finish_call(call_id, name, args, result, t0)
+
+    async def _log_step(self, name: str, args: dict) -> None:
+        """When the model doesn't keep a plan, show what it's doing as one."""
+        if not self.tools.todos_auto:
+            return
+        note = self._step_note.split("\n")[0].strip()
+        self._step_note = ""
+        if note:
+            note = note.split(". ")[0].rstrip(".:")
+        else:
+            from .tui.theme import TOOL_LABELS
+            target = str(args.get("path") or args.get("command") or args.get("pattern")
+                         or args.get("url") or "")
+            target = target.replace(str(self.workdir) + "/", "")
+            note = f"{TOOL_LABELS.get(name, name)} {target}".strip()
+        if len(note) > 60:
+            note = note[:59] + "…"
+        todos = self.tools.todos
+        if todos and todos[-1]["content"] == note:
+            return
+        for t in todos:
+            t["status"] = "completed"
+        todos.append({"content": note, "status": "in_progress"})
+        self.tools.todos = todos[-12:]
+        await self.ui.todos(self.tools.todos)
 
     def set_tool_mode(self, mode: str) -> None:
         self.cfg.tool_mode = mode
@@ -565,6 +607,7 @@ class Agent:
         msgs = [{"role": "system", "content": "You summarize coding sessions precisely."},
                 {"role": "user", "content": f"{COMPACT_PROMPT}\n\n<conversation>\n{transcript}\n</conversation>"}]
         summary = await asyncio.to_thread(self.client.complete, msgs, False, 1200)
+        self.tools.seen.clear()
         if not summary:
             raise OllamaError("the model returned an empty summary")
         self.messages = [

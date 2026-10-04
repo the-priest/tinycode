@@ -67,26 +67,38 @@ def render_diff(diff: str, max_lines: int = 80) -> Text:
     return out
 
 
+DISPLAY_ROOT = ""   # project root, stripped from paths shown in the UI
+
+
+def _rel(p: object) -> str:
+    s = str(p or "")
+    if DISPLAY_ROOT and s.startswith(DISPLAY_ROOT + "/"):
+        return s[len(DISPLAY_ROOT) + 1:]
+    if DISPLAY_ROOT and s == DISPLAY_ROOT:
+        return "."
+    return s
+
+
 def tool_target(name: str, args: dict) -> str:
     if name in ("read_file", "write_file", "edit_file"):
-        s = str(args.get("path", ""))
+        s = _rel(args.get("path", ""))
         if name == "read_file" and args.get("offset"):
             s += f":{args.get('offset')}"
         return s
     if name == "bash":
         return str(args.get("command", ""))
     if name == "glob":
-        p = args.get("path")
+        p = _rel(args.get("path"))
         return str(args.get("pattern", "")) + (f" in {p}" if p and p != "." else "")
     if name == "grep":
         s = repr(str(args.get("pattern", "")))
         if args.get("include"):
             s += f" ({args['include']})"
-        if args.get("path") and args.get("path") != ".":
-            s += f" in {args['path']}"
+        if args.get("path") and _rel(args.get("path")) != ".":
+            s += f" in {_rel(args['path'])}"
         return s
     if name == "list_dir":
-        return str(args.get("path", ".") or ".")
+        return _rel(args.get("path", ".") or ".") or "."
     if name == "todowrite":
         return f"{len(args.get('todos') or [])} items"
     if name == "fetch_url":
