@@ -110,6 +110,13 @@ class FakeOllama:
                         if not send({"content": "", key: text[i:i + size]}
                                     if key == "thinking" else {"content": text[i:i + size]}):
                             return
+                if reply.get("error"):
+                    send({"content": ""})
+                    try:
+                        self.wfile.write(json.dumps({"error": reply["error"]}).encode() + b"\n")
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
                 if reply.get("pause"):
                     time.sleep(reply["pause"])   # silent generation (tool-call args)
                 if reply.get("tool_calls"):

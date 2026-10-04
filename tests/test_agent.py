@@ -189,7 +189,7 @@ def test_untouched_old_config_is_upgraded():
     c.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     c.CONFIG_PATH.write_text(c._V200_TEMPLATE)
     cfg = c.load_config()
-    assert cfg.num_ctx == 32768 and cfg.num_predict == 8192
+    assert cfg.num_ctx == 32768 and cfg.num_predict == 16384
     c.CONFIG_PATH.write_text("[model]\nnum_ctx = 12000\n")   # user's own choice kept
     assert c.load_config().num_ctx == 12000
 
@@ -256,3 +256,19 @@ async def test_stream_mode_unknown_tool_reported(project):
         await agent.run("x")
     results = [m["content"] for m in agent.messages if is_tool_result(m)]
     assert "unknown tool 'teleport'" in results[0]
+
+
+
+async def test_broken_tool_call_from_ollama_is_retried(project):
+    replies = [{"thinking": "write it", "error": 'llama-server returned invalid tool call '
+                'arguments for "write_file": unexpected end of JSON input'},
+               {"tool_calls": [{"name": "write_file", "arguments": {
+                   "path": "t.html", "content": "<html></html>"}}]},
+               {"content": "done"}]
+    with FakeOllama(replies) as fake:
+        ui = RecUI()
+        agent = make(project, fake, ui, mode="yolo")
+        assert await agent.run("make a game") == "done"
+        assert "append=true" in fake.requests[1]["messages"][-1]["content"]
+    assert (project / "t.html").exists()
+    assert any(e[0] == "notice" and "broken" in e[1] for e in ui.events)

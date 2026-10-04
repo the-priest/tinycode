@@ -1,4 +1,4 @@
 """tinycode -- a fast, reliable, fully local coding agent for the terminal."""
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 APP_NAME = "tinycode"

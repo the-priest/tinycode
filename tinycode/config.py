@@ -75,7 +75,7 @@ class Config:
     host: str = "127.0.0.1:11434"
     # sampling / budget
     num_ctx: int = 32768
-    num_predict: int = 8192          # hard cap per model step (stops runaway output)
+    num_predict: int = 16384         # hard cap per model step (stops runaway output)
     temperature: float = 0.6
     top_p: float = 0.95
     top_k: int = 20
@@ -196,7 +196,7 @@ DEFAULT_CONFIG_TOML = """# tinycode configuration
 # model_label = "Ling-3.0-tiny"
 # host = "127.0.0.1:11434"
 # num_ctx = 32768        # context window (tokens). Lower it if you run out of RAM.
-# num_predict = 8192     # max tokens per model step
+# num_predict = 16384    # max tokens per model step
 # temperature = 0.6
 # think = true           # reasoning before acting (slower, more accurate)
 # tool_mode = "native"   # native: Ollama tool calling · stream: experimental live view

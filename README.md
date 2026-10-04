@@ -116,7 +116,7 @@ Then just ask:
 [model]
 model = "hf.co/bloomer010/Ling-3.0-tiny-GGUF:Q4_K_XL"
 num_ctx = 32768        # lower if you're short on RAM
-num_predict = 8192
+num_predict = 16384
 temperature = 0.6
 think = true           # reasoning: slower but more accurate
 tool_mode = "native"   # native: Ollama tool calling · stream: experimental live view

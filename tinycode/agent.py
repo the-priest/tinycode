@@ -149,7 +149,12 @@ class Agent:
                 await self._fit_context()
                 think = self.think and retries == 0
                 nudge = None
-                if last_abort == "length":
+                if last_abort == "broken_call":
+                    nudge = ("Your previous tool call was cut off before it was complete, so "
+                             "nothing was done. If you were writing a big file, write it in "
+                             "parts: write_file with the first part, then write_file with "
+                             "append=true for each next part. Keep each call reasonably short.")
+                elif last_abort == "length":
                     nudge = ("Your previous reply hit the length limit before it finished. "
                              "Try again. If a file is very large you can write it in "
                              "several calls using write_file with append=true.")
@@ -157,7 +162,22 @@ class Agent:
                     nudge = ("Your previous attempt failed (it got stuck or was empty). "
                              "Respond now: either call ONE tool, or give the final answer "
                              "in a few sentences.")
-                res = await self._model_step(think, nudge)
+                try:
+                    res = await self._model_step(think, nudge)
+                except OllamaError as exc:
+                    # Ollama rejects a tool call it can't parse (usually one that was
+                    # cut off by the length limit). Recover instead of ending the turn.
+                    if "tool call" not in str(exc).lower() or retries >= 2 or self._cancel:
+                        raise
+                    log(f"broken tool call, retrying: {exc}")
+                    retries += 1
+                    last_abort = "broken_call"
+                    await self.ui.content_end("")
+                    await self.ui.notice(
+                        "the model's tool call came out broken (probably too long) — "
+                        "retrying", "warn")
+                    step -= 1
+                    continue
 
                 if res.aborted == "cancel":
                     if res.content.strip():
